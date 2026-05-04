@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/dgraph-io/ristretto/v2 v2.2.0
-	github.com/rakunlabs/alan v0.3.2
+	github.com/rakunlabs/alan v0.3.3
 	github.com/rakunlabs/query v0.4.6
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	google.golang.org/protobuf v1.36.7

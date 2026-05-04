@@ -132,6 +132,24 @@
 //   - Consistency is eventual. A follower may serve slightly stale reads
 //     between a leader write and the next sync pull.
 //
+// # Sharing an alan instance
+//
+// If your application needs its own alan messaging alongside cluster sync,
+// use [WithExternalAlan] so both subsystems share one instance:
+//
+//	// Register your app handler and cluster uses the same alan.
+//	a.Handle("app", func(ctx context.Context, msg alan.Message) {
+//	    // msg.Type == "app", msg.Data has prefix stripped.
+//	})
+//	go a.Start(ctx)
+//	<-a.Ready()
+//
+//	c := cluster.New(db, a, cluster.WithExternalAlan())
+//	c.Start(ctx) // registers "bw" handler on alan, does NOT call alan.Start
+//
+// In this mode, [Cluster.Stop] deregisters the "bw" handler but does NOT
+// stop alan — the caller manages alan's lifecycle independently.
+//
 // [alan]: https://github.com/rakunlabs/alan
 package cluster
 
@@ -169,7 +187,12 @@ type Cluster struct {
 
 	lockKey      string
 	syncInterval time.Duration
-	prefix       []byte // message namespace prefix to avoid collisions
+	prefix       string // message namespace prefix to avoid collisions
+
+	// externalAlan, when true, means alan is managed externally. The cluster
+	// registers its handler on alan under its prefix but does not call
+	// alan.Start/Stop.
+	externalAlan bool
 
 	isLeader   atomic.Bool
 	leaderAddr atomic.Pointer[net.UDPAddr]
@@ -205,7 +228,7 @@ func WithSyncInterval(d time.Duration) Option {
 // same alan instance to coexist without message collisions.
 // Default: "bw".
 func WithPrefix(prefix string) Option {
-	return func(c *Cluster) { c.prefix = []byte(prefix) }
+	return func(c *Cluster) { c.prefix = prefix }
 }
 
 // WithOnLeaderChange registers a callback invoked when this node gains or
@@ -226,6 +249,24 @@ func WithForwardHandler(fn func(ctx context.Context, data []byte) []byte) Option
 	return func(c *Cluster) { c.forwardHandler = fn }
 }
 
+// WithExternalAlan indicates that the alan instance is managed externally
+// (already started or will be started by the caller). When set, [Cluster.Start]
+// does NOT call alan.Start — it only registers a handler via alan.Handle under
+// the cluster's prefix. [Cluster.Stop] deregisters the handler but does not
+// stop alan.
+//
+// This allows multiple subsystems to share a single alan instance:
+//
+//	a.Handle("app", appHandler)
+//	go a.Start(ctx)
+//	<-a.Ready()
+//
+//	c := cluster.New(db, a, cluster.WithExternalAlan())
+//	c.Start(ctx)
+func WithExternalAlan() Option {
+	return func(c *Cluster) { c.externalAlan = true }
+}
+
 // New creates a new Cluster. The alan.Alan instance should NOT be started yet;
 // Start will call alan.Start internally.
 func New(db *bw.DB, a *alan.Alan, opts ...Option) *Cluster {
@@ -234,7 +275,7 @@ func New(db *bw.DB, a *alan.Alan, opts ...Option) *Cluster {
 		alan:         a,
 		lockKey:      "bw-leader",
 		syncInterval: 5 * time.Minute,
-		prefix:       []byte("bw"),
+		prefix:       "bw",
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -258,19 +299,31 @@ func (c *Cluster) LeaderAddr() *net.UDPAddr { return c.leaderAddr.Load() }
 // launches the periodic sync loop. It returns once alan is ready to
 // send/receive. The background goroutines run until ctx is cancelled or
 // Stop is called.
+//
+// If [WithMux] was used, alan is assumed to be already started by the caller.
+// The cluster registers its handler on the mux and does not manage alan's
+// lifecycle.
 func (c *Cluster) Start(ctx context.Context) error {
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.alan.Start(ctx, c.handleMessage)
-	}()
+	// Register our handler under the cluster prefix. Alan's type-based
+	// routing delivers messages with msg.Type == c.prefix directly.
+	c.alan.Handle(c.prefix, c.handleMsg)
 
-	// Wait for alan to be ready or fail.
-	select {
-	case <-c.alan.Ready():
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	if c.externalAlan {
+		// External mode: alan is already running.
+	} else {
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- c.alan.Start(ctx)
+		}()
+
+		// Wait for alan to be ready or fail.
+		select {
+		case <-c.alan.Ready():
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	go c.leaderLoop(ctx)
@@ -279,8 +332,15 @@ func (c *Cluster) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the cluster and the underlying alan instance.
-func (c *Cluster) Stop() { c.alan.Stop() }
+// Stop gracefully shuts down the cluster. If [WithMux] was used, it
+// deregisters from the mux but does NOT stop alan. Otherwise it stops alan.
+func (c *Cluster) Stop() {
+	if c.externalAlan {
+		c.alan.Remove(c.prefix)
+	} else {
+		c.alan.Stop()
+	}
+}
 
 // NotifySync broadcasts a sync notification to all followers. Call this after
 // writing to the database while this node is the leader.
@@ -332,7 +392,7 @@ func (c *Cluster) Forward(ctx context.Context, data []byte) ([]byte, error) {
 	payload[0] = msgForward
 	copy(payload[1:], data)
 
-	reply, err := c.alan.SendToAndWaitReply(ctx, addr, c.wrapMsg(payload))
+	reply, err := c.alan.SendToAndWaitReply(ctx, addr, c.prefix, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +439,7 @@ func (c *Cluster) catchUp(ctx context.Context) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	replies, err := c.alan.SendAndWaitReply(reqCtx, c.wrapMsg([]byte{msgVersionRequest}))
+	replies, err := c.alan.SendAndWaitReply(reqCtx, c.prefix, []byte{msgVersionRequest})
 	if err != nil && len(replies) == 0 {
 		return
 	}
@@ -430,7 +490,7 @@ func (c *Cluster) requestSyncFrom(ctx context.Context, addr *net.UDPAddr) error 
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	reply, err := c.alan.SendToAndWaitReply(reqCtx, addr, c.wrapMsg(payload))
+	reply, err := c.alan.SendToAndWaitReply(reqCtx, addr, c.prefix, payload)
 	if err != nil {
 		return err
 	}
@@ -452,7 +512,7 @@ func (c *Cluster) broadcastVersion() {
 	payload := make([]byte, 9)
 	payload[0] = msgSyncNotify
 	binary.BigEndian.PutUint64(payload[1:], version)
-	c.alan.Send(c.wrapMsg(payload))
+	c.alan.Send(c.prefix, payload)
 }
 
 // periodicSync runs on followers and pulls from the leader every syncInterval.
@@ -490,26 +550,6 @@ func (c *Cluster) periodicSync(ctx context.Context) {
 // Message framing — prefix + tag
 // ---------------------------------------------------------------------------
 
-// wrapMsg prepends the namespace prefix to a message payload.
-func (c *Cluster) wrapMsg(payload []byte) []byte {
-	out := make([]byte, len(c.prefix)+len(payload))
-	copy(out, c.prefix)
-	copy(out[len(c.prefix):], payload)
-	return out
-}
-
-// unwrapMsg checks the prefix and strips it, returning the inner payload.
-// Returns nil if the prefix does not match.
-func (c *Cluster) unwrapMsg(data []byte) []byte {
-	if len(data) < len(c.prefix) {
-		return nil
-	}
-	if !bytes.Equal(data[:len(c.prefix)], c.prefix) {
-		return nil
-	}
-	return data[len(c.prefix):]
-}
-
 // isPeerGone returns true if the error indicates the peer has left the cluster
 // (disconnected, no connection, etc.). These are transient and expected during
 // leader failover.
@@ -528,16 +568,13 @@ func isPeerGone(err error) bool {
 // Message handler
 // ---------------------------------------------------------------------------
 
-func (c *Cluster) handleMessage(ctx context.Context, msg alan.Message) {
-	inner := c.unwrapMsg(msg.Data)
-	if len(inner) == 0 {
+// handleMsg dispatches incoming cluster messages by tag byte.
+func (c *Cluster) handleMsg(ctx context.Context, msg alan.Message) {
+	if len(msg.Data) == 0 {
 		return
 	}
 
-	// Replace the raw data with the unwrapped inner payload for handlers.
-	msg.Data = inner
-
-	switch inner[0] {
+	switch msg.Data[0] {
 	case msgSyncNotify:
 		c.onSyncNotify(ctx, msg)
 	case msgSyncRequest:
