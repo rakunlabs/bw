@@ -14,12 +14,8 @@
 package bw
 
 import (
-	"errors"
-	"fmt"
-
 	"github.com/dgraph-io/badger/v4"
 	"github.com/rakunlabs/bw/codec"
-	"github.com/rakunlabs/bw/schema"
 )
 
 // DB is a bw database handle. It wraps a *badger.DB plus the codec and any
@@ -83,37 +79,3 @@ func (db *DB) Codec() codec.Codec { return db.codec }
 // Badger returns the underlying *badger.DB. Use sparingly: writes that
 // bypass bw's bucket abstraction will not maintain indexes.
 func (db *DB) Badger() *badger.DB { return db.bdb }
-
-// ensureSchema persists or validates the schema fingerprint for a bucket.
-// On first registration it writes the fingerprint; on subsequent ones it
-// compares and refuses to proceed when the index/unique surface differs
-// from what the bucket already has on disk (which would silently corrupt
-// the existing index entries).
-func (db *DB) ensureSchema(bucket string, s *schema.Schema) error {
-	if s == nil {
-		return nil
-	}
-	want := s.Fingerprint()
-	mkey := metaKey(bucket)
-
-	return db.bdb.Update(func(btx *badger.Txn) error {
-		item, err := btx.Get(mkey)
-		switch {
-		case err == nil:
-			got, vErr := item.ValueCopy(nil)
-			if vErr != nil {
-				return vErr
-			}
-			if string(got) != want {
-				return fmt.Errorf("bw: schema fingerprint mismatch for bucket %q (have %s, want %s); migrate or pick a new bucket name",
-					bucket, string(got), want)
-			}
-
-			return nil
-		case errors.Is(err, badger.ErrKeyNotFound):
-			return btx.Set(mkey, []byte(want))
-		default:
-			return err
-		}
-	})
-}

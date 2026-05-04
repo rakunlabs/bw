@@ -124,6 +124,64 @@ repeat as long as the full tuple is distinct:
 (Code="TR", Prefix="34") + (Code="TR", Prefix="34")  → ErrConflict (on different PKs)
 ```
 
+### Schema evolution (adding/removing fields)
+
+When you change a struct (add new fields, add/remove indexes), use
+`WithVersion` to tell `RegisterBucket` to auto-migrate:
+
+```go
+// V1 — original schema.
+type User struct {
+    ID   string `bw:"id,pk"`
+    Name string `bw:"name,index"`
+}
+
+// V2 — added Email (unique) and Age (indexed).
+type User struct {
+    ID    string `bw:"id,pk"`
+    Name  string `bw:"name,index"`
+    Email string `bw:"email,unique"`
+    Age   int    `bw:"age,index"`
+}
+```
+
+```go
+// Bump the version number each time you change the index/unique surface.
+// RegisterBucket auto-migrates when stored version < provided version.
+users, err := bw.RegisterBucket[User](db, "users", bw.WithVersion[User](2))
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+That's it. No manual two-step `MigrateBucket` call needed — just bump
+the version number when you change the struct.
+
+**What happens under the hood (incremental):**
+
+It does NOT drop all indexes and rebuild everything. It diffs the old
+schema against the new one and only touches what changed:
+
+1. Fields that **lost** their `index` tag → only those index keys are deleted.
+2. Fields that **lost** their `unique` tag → only those unique keys are deleted.
+3. Fields that are **newly** indexed/unique → scans data and builds entries
+   only for those fields.
+4. Fields whose flags are **unchanged** → left completely alone (no I/O).
+5. Updates the stored fingerprint, version, and manifest.
+
+**Rules:**
+
+- Additive changes (new fields) are safe — old records get zero values.
+- Removing an index is safe — the stale index keys are cleaned up.
+- Changing the primary key field or its `bw` tag name requires a manual
+  data migration (you'd need to re-key every record).
+- Zero-value unique fields (empty string, nil slice) are skipped during
+  migration to avoid false conflicts on old records that lack the new
+  field.
+- If you don't provide `WithVersion`, the old strict behavior applies
+  (fingerprint mismatch = error). You can still call `MigrateBucket`
+  explicitly in that case.
+
 ### Defaults
 
 ```go

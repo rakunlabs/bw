@@ -45,6 +45,11 @@ type Bucket[T any] struct {
 	// compositeQueryFields is the slice of composite indexed fields
 	// handed to the query planner.
 	compositeQueryFields []engine.CompositeIndexedField
+
+	// version is the caller-supplied schema version. When set (>0) and
+	// higher than the stored version, RegisterBucket auto-migrates
+	// instead of returning a fingerprint mismatch error.
+	version uint64
 }
 
 // BucketOption configures a Bucket at registration time.
@@ -55,6 +60,16 @@ type BucketOption[T any] func(*Bucket[T])
 // composed from multiple fields.
 func WithKeyFn[T any](fn func(*T) ([]byte, error)) BucketOption[T] {
 	return func(b *Bucket[T]) { b.keyFn = fn }
+}
+
+// WithVersion sets the schema version for this bucket. When the stored
+// version is lower than the provided one, RegisterBucket automatically
+// performs an incremental migration (only rebuilding indexes for changed
+// fields) instead of failing with a fingerprint mismatch.
+//
+// Bump this number each time you change the struct's index/unique surface.
+func WithVersion[T any](v uint64) BucketOption[T] {
+	return func(b *Bucket[T]) { b.version = v }
 }
 
 // RegisterBucket parses T's schema and returns a typed Bucket bound to db.
@@ -131,7 +146,7 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		}
 	}
 
-	if err := db.ensureSchema(name, s); err != nil {
+	if err := db.ensureSchemaOrMigrate(name, s, b.version, b); err != nil {
 		return nil, err
 	}
 
