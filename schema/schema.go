@@ -43,6 +43,9 @@ type Field struct {
 	// UniqueGroup is non-empty when this field belongs to a named
 	// composite unique constraint (e.g. `bw:"code,unique:country_code"`).
 	UniqueGroup string
+	// FTS is true if a full-text search index should be maintained on
+	// this field (only string fields are supported).
+	FTS bool
 }
 
 // CompositeGroup describes a named group of fields that form a composite
@@ -99,6 +102,9 @@ func (s *Schema) Fingerprint() string {
 				flags += ":" + f.UniqueGroup
 			}
 		}
+		if f.FTS {
+			flags += "F"
+		}
 		rows = append(rows, entry{Name: f.Name, Flags: flags})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
@@ -129,6 +135,18 @@ func (s *Schema) UniqueFields() []*Field {
 	out := make([]*Field, 0)
 	for _, f := range s.Fields {
 		if f.Unique {
+			out = append(out, f)
+		}
+	}
+
+	return out
+}
+
+// FTSFields returns the subset of Fields tagged with `fts`.
+func (s *Schema) FTSFields() []*Field {
+	out := make([]*Field, 0)
+	for _, f := range s.Fields {
+		if f.FTS {
 			out = append(out, f)
 		}
 	}
@@ -292,6 +310,8 @@ func walkStruct(t reflect.Type, indexPrefix []int, s *Schema) error {
 				case strings.HasPrefix(flag, "unique:"):
 					f.Unique = true
 					f.UniqueGroup = strings.TrimPrefix(flag, "unique:")
+				case flag == "fts":
+					f.FTS = true
 				case flag == "":
 					// trailing comma, ignore
 				default:

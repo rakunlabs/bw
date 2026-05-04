@@ -2,6 +2,7 @@ package bw
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
@@ -50,6 +51,10 @@ type Bucket[T any] struct {
 	// higher than the stored version, RegisterBucket auto-migrates
 	// instead of returning a fingerprint mismatch error.
 	version uint64
+
+	// ftsIdx is the full-text search index for this bucket, or nil when
+	// no FTS-tagged fields exist.
+	ftsIdx *ftsIndex
 }
 
 // BucketOption configures a Bucket at registration time.
@@ -148,6 +153,17 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 
 	if err := db.ensureSchemaOrMigrate(name, s, b.version, b); err != nil {
 		return nil, err
+	}
+
+	// Open FTS index if any fields are tagged with `fts`.
+	ftsFields := s.FTSFields()
+	if len(ftsFields) > 0 {
+		fi, err := openFTSIndex(db, name, ftsFields)
+		if err != nil {
+			return nil, err
+		}
+		b.ftsIdx = fi
+		db.fts.set(name, fi)
 	}
 
 	return b, nil
@@ -337,7 +353,18 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 		}
 	}
 
-	return tx.btx.Delete(dKey)
+	if err := tx.btx.Delete(dKey); err != nil {
+		return err
+	}
+
+	if b.ftsIdx != nil {
+		pkHex := hex.EncodeToString(pk)
+		if err := b.ftsIdx.deleteDoc(pkHex); err != nil {
+			return fmt.Errorf("bw: fts delete: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // upsertTx implements both Insert (insertNewOnly=false, overwrite ok) and
@@ -395,7 +422,21 @@ func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
 		}
 	}
 
-	return tx.btx.Set(dKey, val)
+	if err := tx.btx.Set(dKey, val); err != nil {
+		return err
+	}
+
+	// Update FTS index (outside the Badger txn since Bleve manages its
+	// own storage). This is best-effort: if FTS indexing fails the data
+	// write still succeeds but we surface the error so callers can react.
+	if b.ftsIdx != nil {
+		pkHex := hex.EncodeToString(pk)
+		if err := b.ftsIdx.indexDoc(pkHex, record); err != nil {
+			return fmt.Errorf("bw: fts index: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // Get retrieves the record stored under key. Returns ErrNotFound if there
@@ -465,7 +506,18 @@ func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 			}
 		}
 
-		return tx.btx.Delete(dKey)
+		if err := tx.btx.Delete(dKey); err != nil {
+			return err
+		}
+
+		if b.ftsIdx != nil {
+			pkHex := hex.EncodeToString(pk)
+			if err := b.ftsIdx.deleteDoc(pkHex); err != nil {
+				return fmt.Errorf("bw: fts delete: %w", err)
+			}
+		}
+
+		return nil
 	})
 }
 
@@ -642,4 +694,61 @@ func keyAsBytes(k any) ([]byte, error) {
 	}
 
 	return pkBytes(reflect.ValueOf(k))
+}
+
+// SearchResult holds a matched record along with its relevance score.
+type SearchResult[T any] struct {
+	Record *T
+	Score  float64
+}
+
+// Search performs a full-text search over the bucket's FTS-tagged fields
+// using Bleve's query string syntax. It returns matched records hydrated
+// from BadgerDB, ordered by relevance score (highest first).
+//
+// Returns ErrNoFTS if the bucket has no FTS-tagged fields.
+// limit and offset control pagination (0 limit means default 10).
+func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int) ([]SearchResult[T], uint64, error) {
+	_ = ctx
+
+	if b.ftsIdx == nil {
+		return nil, 0, ErrNoFTS
+	}
+
+	if limit <= 0 {
+		limit = 10
+	}
+
+	hits, total, err := b.ftsIdx.search(query, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("bw: search: %w", err)
+	}
+
+	results := make([]SearchResult[T], 0, len(hits))
+	err = b.db.View(func(tx *Tx) error {
+		for _, h := range hits {
+			pk, decErr := hex.DecodeString(h.ID)
+			if decErr != nil {
+				continue // skip corrupted entries
+			}
+			item, getErr := tx.btx.Get(dataKey(b.name, pk))
+			if getErr != nil {
+				continue // record may have been deleted
+			}
+			rec := new(T)
+			if err := item.Value(func(val []byte) error {
+				return b.codec.Unmarshal(val, rec)
+			}); err != nil {
+				continue
+			}
+			results = append(results, SearchResult[T]{Record: rec, Score: h.Score})
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return results, total, nil
 }

@@ -23,6 +23,8 @@ import (
 type DB struct {
 	bdb   *badger.DB
 	codec codec.Codec
+	path  string       // filesystem path; empty for in-memory databases
+	fts   *ftsRegistry // full-text search indexes
 }
 
 // Open opens (or creates) a bw database at the given filesystem path.
@@ -58,16 +60,27 @@ func Open(path string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 
+	dbPath := ""
+	if o.inMem == nil || !*o.inMem {
+		dbPath = path
+	}
+
 	return &DB{
 		bdb:   bdb,
 		codec: o.codec,
+		path:  dbPath,
+		fts:   newFTSRegistry(),
 	}, nil
 }
 
-// Close closes the underlying Badger database.
+// Close closes the underlying Badger database and all FTS indexes.
 func (db *DB) Close() error {
 	if db == nil || db.bdb == nil {
 		return nil
+	}
+
+	if db.fts != nil {
+		db.fts.closeAll()
 	}
 
 	return db.bdb.Close()

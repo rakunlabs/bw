@@ -18,4 +18,7 @@ var (
 	// ErrReadOnlyTx is returned when a mutating call is made on a
 	// read-only transaction.
 	ErrReadOnlyTx = errors.New("bw: read-only transaction")
+	// ErrNoFTS is returned when Search is called on a bucket with no
+	// FTS-tagged fields.
+	ErrNoFTS = errors.New("bw: no full-text search fields configured")
 )
