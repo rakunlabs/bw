@@ -25,8 +25,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/quic-go/quic-go v0.59.0 h1:OLJkp1Mlm/aS7dpKgTc6cnpynnD2Xg7C1pwL6vy/SAw=
 github.com/quic-go/quic-go v0.59.0/go.mod h1:upnsH4Ju1YkqpLXC305eW3yDZ4NfnNbmQRCMWS58IKU=
-github.com/rakunlabs/alan v0.3.1 h1:cn/Bbay5HwahOkx9Ee4wxLt0YhBK5LGJVy+ajgEEMdc=
-github.com/rakunlabs/alan v0.3.1/go.mod h1:MfDCHpkz9rCUE3fhgbWRFAH+L1VvxDJBYQHibRasN4I=
+github.com/rakunlabs/alan v0.3.2 h1:RlqH7f8kmDHTcFKdC0B3LfIcL/x4DDI5J2sXiin6fBE=
+github.com/rakunlabs/alan v0.3.2/go.mod h1:MfDCHpkz9rCUE3fhgbWRFAH+L1VvxDJBYQHibRasN4I=
 github.com/rakunlabs/query v0.4.6 h1:rNbuf6BUNPwisPrtwiaof6GHCizErcEgPWKxiDwn3wk=
 github.com/rakunlabs/query v0.4.6/go.mod h1:2DGX9UqBE4PaaWAZ+eR/v6lWiSJ376ar7L0jDTORcpo=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
