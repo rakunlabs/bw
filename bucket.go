@@ -447,31 +447,57 @@ func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
 // Insert.
 func (b *Bucket[T]) Get(ctx context.Context, key any) (*T, error) {
 	_ = ctx
+
+	var out *T
+	err := b.db.View(func(tx *Tx) error {
+		rec, err := b.getTx(tx, key)
+		if err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetTx is like Get but operates on a caller-controlled transaction.
+// Use it when a downstream Insert/Update/Delete needs to observe writes
+// that have not yet been committed: the bucket's standalone Get opens
+// its own read-only view, and Badger's MVCC isolation hides in-flight
+// writes from that view.
+func (b *Bucket[T]) GetTx(tx *Tx, key any) (*T, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("bw: nil transaction")
+	}
+	return b.getTx(tx, key)
+}
+
+// getTx is the shared implementation for Get and GetTx. The caller
+// must supply the transaction; both rw and read-only txs are accepted.
+func (b *Bucket[T]) getTx(tx *Tx, key any) (*T, error) {
 	pk, err := keyAsBytes(key)
 	if err != nil {
 		return nil, err
 	}
 
-	var out T
-	err = b.db.View(func(tx *Tx) error {
-		item, err := tx.btx.Get(dataKey(b.name, pk))
-		if err != nil {
-			if errors.Is(err, badger.ErrKeyNotFound) {
-				return ErrNotFound
-			}
-
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			return b.codec.Unmarshal(val, &out)
-		})
-	})
+	item, err := tx.btx.Get(dataKey(b.name, pk))
 	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, ErrNotFound
+		}
 		return nil, err
 	}
 
-	return &out, nil
+	out := new(T)
+	if err := item.Value(func(val []byte) error {
+		return b.codec.Unmarshal(val, out)
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Delete removes the record with the given key, plus every index/unique
@@ -533,39 +559,57 @@ func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 // layer, so the codec only decodes each value once.
 func (b *Bucket[T]) Find(ctx context.Context, q *query.Query) ([]*T, error) {
 	_ = ctx
+
 	var results []*T
-
-	// Strip Sort/Offset/Limit from the engine's view of q: we'll apply
-	// them on the typed slice ourselves so each record is decoded only
-	// once.
-	scanQ, sortSpec, offset, limit := splitSortPaging(q)
-
 	err := b.db.View(func(tx *Tx) error {
-		matches, err := b.scan(tx.btx, scanQ)
+		out, err := b.findTx(tx, q)
 		if err != nil {
 			return err
 		}
-
-		results = make([]*T, 0, len(matches))
-		for _, m := range matches {
-			rec := new(T)
-			if err := b.codec.Unmarshal(m.Value, rec); err != nil {
-				return err
-			}
-			results = append(results, rec)
-		}
-
+		results = out
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	return results, nil
+}
+
+// FindTx is like Find but operates on a caller-controlled transaction.
+// Sort/Offset/Limit/Select from q are honoured. Use this when the
+// caller is mid-transaction and needs to observe pending writes.
+func (b *Bucket[T]) FindTx(tx *Tx, q *query.Query) ([]*T, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("bw: nil transaction")
+	}
+	return b.findTx(tx, q)
+}
+
+// findTx is the shared implementation for Find and FindTx.
+func (b *Bucket[T]) findTx(tx *Tx, q *query.Query) ([]*T, error) {
+	// Strip Sort/Offset/Limit from the engine's view of q: we apply
+	// them on the typed slice ourselves so each record is decoded only
+	// once.
+	scanQ, sortSpec, offset, limit := splitSortPaging(q)
+
+	matches, err := b.scan(tx.btx, scanQ)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]*T, 0, len(matches))
+	for _, m := range matches {
+		rec := new(T)
+		if err := b.codec.Unmarshal(m.Value, rec); err != nil {
+			return nil, err
+		}
+		results = append(results, rec)
 	}
 
 	if len(sortSpec) > 0 {
 		b.sortTyped(results, sortSpec)
 	}
 	results = applyOffsetLimitTyped(results, offset, limit)
-
 	return results, nil
 }
 
@@ -573,28 +617,39 @@ func (b *Bucket[T]) Find(ctx context.Context, q *query.Query) ([]*T, error) {
 // Limit are honoured.
 func (b *Bucket[T]) Walk(ctx context.Context, q *query.Query, fn func(*T) error) error {
 	_ = ctx
-
 	return b.db.View(func(tx *Tx) error {
-		plan := b.plan(q)
-		walkFn := func(m engine.Match) error {
-			rec := new(T)
-			if err := b.codec.Unmarshal(m.Value, rec); err != nil {
-				return err
-			}
-
-			return fn(rec)
-		}
-		switch plan.Kind {
-		case engine.PlanIndexEq, engine.PlanIndexRange:
-			return engine.IndexWalk(tx.btx, b.indexScanOpts(plan, q), walkFn)
-		default:
-			return engine.Walk(tx.btx, engine.ScanOptions{
-				Prefix: dataPrefix(b.name),
-				Codec:  b.codec,
-				Query:  withWhere(q, plan.ResidualWhere),
-			}, walkFn)
-		}
+		return b.walkTx(tx, q, fn)
 	})
+}
+
+// WalkTx is like Walk but operates on a caller-controlled transaction.
+func (b *Bucket[T]) WalkTx(tx *Tx, q *query.Query, fn func(*T) error) error {
+	if tx == nil {
+		return fmt.Errorf("bw: nil transaction")
+	}
+	return b.walkTx(tx, q, fn)
+}
+
+// walkTx is the shared implementation for Walk and WalkTx.
+func (b *Bucket[T]) walkTx(tx *Tx, q *query.Query, fn func(*T) error) error {
+	plan := b.plan(q)
+	walkFn := func(m engine.Match) error {
+		rec := new(T)
+		if err := b.codec.Unmarshal(m.Value, rec); err != nil {
+			return err
+		}
+		return fn(rec)
+	}
+	switch plan.Kind {
+	case engine.PlanIndexEq, engine.PlanIndexRange:
+		return engine.IndexWalk(tx.btx, b.indexScanOpts(plan, q), walkFn)
+	default:
+		return engine.Walk(tx.btx, engine.ScanOptions{
+			Prefix: dataPrefix(b.name),
+			Codec:  b.codec,
+			Query:  withWhere(q, plan.ResidualWhere),
+		}, walkFn)
+	}
 }
 
 // scan picks a plan and returns the matching set.
@@ -649,8 +704,29 @@ func withWhere(q *query.Query, where []query.Expression) *query.Query {
 func (b *Bucket[T]) Count(ctx context.Context, q *query.Query) (uint64, error) {
 	_ = ctx
 	var n uint64
+	err := b.db.View(func(tx *Tx) error {
+		count, err := b.countTx(tx, q)
+		n = count
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
 
-	// Drop offset/limit while counting.
+// CountTx is like Count but operates on a caller-controlled transaction.
+func (b *Bucket[T]) CountTx(tx *Tx, q *query.Query) (uint64, error) {
+	if tx == nil {
+		return 0, fmt.Errorf("bw: nil transaction")
+	}
+	return b.countTx(tx, q)
+}
+
+// countTx is the shared implementation for Count and CountTx.
+func (b *Bucket[T]) countTx(tx *Tx, q *query.Query) (uint64, error) {
+	// Drop offset/limit/sort while counting; Count's contract ignores
+	// those even when present in q.
 	var qq *query.Query
 	if q != nil {
 		clone := *q
@@ -660,21 +736,18 @@ func (b *Bucket[T]) Count(ctx context.Context, q *query.Query) (uint64, error) {
 		qq = &clone
 	}
 
-	err := b.db.View(func(tx *Tx) error {
-		return engine.Walk(tx.btx, engine.ScanOptions{
-			Prefix: dataPrefix(b.name),
-			Codec:  b.codec,
-			Query:  qq,
-		}, func(engine.Match) error {
-			n++
-
-			return nil
-		})
+	var n uint64
+	err := engine.Walk(tx.btx, engine.ScanOptions{
+		Prefix: dataPrefix(b.name),
+		Codec:  b.codec,
+		Query:  qq,
+	}, func(engine.Match) error {
+		n++
+		return nil
 	})
 	if err != nil {
 		return 0, err
 	}
-
 	return n, nil
 }
 

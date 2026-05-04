@@ -92,3 +92,37 @@ func (db *DB) Codec() codec.Codec { return db.codec }
 // Badger returns the underlying *badger.DB. Use sparingly: writes that
 // bypass bw's bucket abstraction will not maintain indexes.
 func (db *DB) Badger() *badger.DB { return db.bdb }
+
+// Wipe drops every key from the database — data, indexes, unique
+// reservations, and bucket schema metadata — and resets every
+// registered FTS index. It is destructive and irreversible. Use it
+// when you want to follow up with Restore for a clean swap.
+//
+// In-process bucket handles returned from RegisterBucket remain valid
+// after Wipe: their schema, codec and FTS pointers are mutated in
+// place. The next write into a bucket re-establishes its meta keys
+// transparently.
+//
+// Caveats inherited from Badger:
+//   - DropAll blocks all writes for the duration of the wipe.
+//   - DropAll is NOT safe to run concurrently with reads. Quiesce all
+//     RPCs that touch the DB before calling Wipe.
+//   - The FTS reset closes and removes each per-bucket Bleve index
+//     directory before re-opening a fresh one. If the reopen fails
+//     the bucket's FTS index remains nil and subsequent FTS writes
+//     return an error until the process is restarted (which calls
+//     RegisterBucket again).
+func (db *DB) Wipe() error {
+	if db == nil || db.bdb == nil {
+		return nil
+	}
+	if err := db.bdb.DropAll(); err != nil {
+		return err
+	}
+	if db.fts != nil {
+		if err := db.fts.resetAll(db); err != nil {
+			return err
+		}
+	}
+	return nil
+}

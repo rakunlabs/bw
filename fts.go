@@ -55,6 +55,52 @@ func (r *ftsRegistry) closeAll() {
 	r.indexes = make(map[string]*ftsIndex)
 }
 
+// resetAll closes every registered Bleve index, removes its on-disk
+// directory (if any), and reopens a fresh empty index in place. Used
+// by DB.Wipe to keep search hits in sync with the just-cleared data
+// buckets — without this, old documents would remain searchable even
+// after their underlying Badger keys are gone.
+//
+// The reset mutates the existing *ftsIndex value rather than swapping
+// the registry entry: every Bucket[T] caches its ftsIdx pointer at
+// registration time, so in-place mutation is the only way to keep
+// that cache valid without forcing buckets to re-resolve through the
+// registry on every write.
+//
+// Order is: close → remove dir → re-open. The new index can't be
+// created at the same path while the old one is still open, so the
+// reopen is a window of vulnerability: if it fails, the registry
+// entry still exists with a nil index. Subsequent writes on that
+// bucket return an error from Bleve until the next process restart
+// re-registers the bucket. Callers should treat a Wipe error as
+// unrecoverable.
+func (r *ftsRegistry) resetAll(db *DB) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for bucket, fi := range r.indexes {
+		if fi == nil {
+			continue
+		}
+		if fi.index != nil {
+			_ = fi.index.Close()
+			fi.index = nil
+		}
+		if db.path != "" {
+			dir := filepath.Join(db.path, "_fts_"+bucket)
+			if err := os.RemoveAll(dir); err != nil {
+				return fmt.Errorf("bw: wipe fts %q: %w", bucket, err)
+			}
+		}
+		fresh, err := openFTSIndex(db, bucket, fi.fields)
+		if err != nil {
+			return fmt.Errorf("bw: reopen fts %q: %w", bucket, err)
+		}
+		fi.index = fresh.index
+	}
+	return nil
+}
+
 // openFTSIndex opens or creates a Bleve index for the given bucket. The
 // index is stored at <db-dir>/_fts_<bucket>. For in-memory databases, a
 // memory-only Bleve mapping is used.

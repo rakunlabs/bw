@@ -124,3 +124,57 @@ func TestSearch_NoFTSFields(t *testing.T) {
 		t.Errorf("expected ErrNoFTS, got %v", err)
 	}
 }
+
+// TestWipe_ResetsFTSIndex verifies DB.Wipe drops every FTS document
+// alongside the data, and that the bucket's cached *ftsIndex pointer
+// stays valid afterwards (resetAll mutates the struct in place).
+func TestWipe_ResetsFTSIndex(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open("", WithInMemory(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	bucket, err := RegisterBucket[Article](db, "articles")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bucket.Insert(ctx, &Article{ID: "1", Title: "Go", Body: "Go programming language"}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, total, err := bucket.Search(ctx, "Go", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total == 0 || len(results) == 0 {
+		t.Fatalf("pre-wipe search: want hits, got total=%d len=%d", total, len(results))
+	}
+
+	if err := db.Wipe(); err != nil {
+		t.Fatalf("Wipe: %v", err)
+	}
+
+	// Old documents should no longer be findable.
+	_, total, err = bucket.Search(ctx, "Go", 10, 0)
+	if err != nil {
+		t.Fatalf("Search post-wipe: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("post-wipe search total = %d, want 0", total)
+	}
+
+	// New writes go through the freshly opened FTS index.
+	if err := bucket.Insert(ctx, &Article{ID: "2", Title: "Rust", Body: "Rust systems language"}); err != nil {
+		t.Fatalf("Insert post-wipe: %v", err)
+	}
+	results, total, err = bucket.Search(ctx, "Rust", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(results) != 1 {
+		t.Fatalf("post-wipe search for new doc: want 1 hit, got total=%d len=%d", total, len(results))
+	}
+}
