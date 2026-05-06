@@ -275,9 +275,9 @@ go get github.com/rakunlabs/bw/cluster
 ```mermaid
 graph LR
     F1["Follower<br/>(read-only)<br/>local read"] -- "write" --> L["Leader<br/>(read-write)<br/>backup diff"]
-    L -- "SyncNotify" --> F2["Follower<br/>(read-only)<br/>local read"]
-    F2 -- "SyncReq" --> L
-    L -- "SyncReq" --> F1
+    L -- "Push (stream)" --> F2["Follower<br/>(read-only)<br/>local read"]
+    L -- "Push (stream)" --> F1
+    F1 -- "PullReq" --> L
 ```
 
 - **Leader election**: alan's distributed lock (`LeaderLoop`). If the
@@ -286,12 +286,18 @@ graph LR
   `IsLeader()` check and its own transport, or uses the built-in
   `Forward()` helper (see below).
 - **Reads**: always local. Every node serves reads from its own database.
-- **Sync after write**: leader calls `NotifySync()`, followers see they
-  are behind, pull the incremental diff via request-reply, and apply it.
-- **Periodic sync**: followers poll the leader every N minutes (default 5)
-  as a safety net.
+- **Sync after write**: leader calls `NotifySync(ctx)`, which pushes the
+  incremental diff to every behind follower over a QUIC stream and blocks
+  until each one has finished restoring it. Stream completion is the
+  acknowledgement, so when `NotifySync` returns nil all reachable
+  followers are caught up.
+- **Periodic sync**: followers pull from the leader every N minutes
+  (default 5) as a safety net for missed pushes.
 - **Leader catch-up**: a newly elected leader asks all peers for their
   version and pulls the diff from whichever peer is furthest ahead.
+- **Stream transfer**: diff data uses alan's `SendToStream` /
+  `HandleStream`, so there is no `MaxMessageSize` cap and the receiver
+  pipes the body directly into `bw.DB.Restore`.
 
 ### Usage
 
@@ -348,10 +354,13 @@ func main() {
     u, _ := users.Get(ctx, "u1")
     _ = u
 
-    // 6. Writes — leader only.
+    // 6. Writes — leader only. NotifySync blocks until followers
+    //    have applied the diff (or ctx is cancelled).
     if c.IsLeader() {
         _ = users.Insert(ctx, &User{ID: "u1", Name: "Elif"})
-        c.NotifySync()
+        if err := c.NotifySync(ctx); err != nil {
+            log.Printf("notify sync: %v", err)
+        }
     }
 }
 ```
@@ -396,7 +405,7 @@ c := cluster.New(db, a,
         json.Unmarshal(data, &req)
 
         _ = users.Insert(ctx, &User{ID: req.ID, Name: req.Name})
-        c.NotifySync()
+        _ = c.NotifySync(ctx) // wait for followers to catch up
 
         resp, _ := json.Marshal(CreateUserResponse{OK: true})
         return resp

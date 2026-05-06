@@ -3,9 +3,10 @@ module github.com/rakunlabs/bw
 go 1.26
 
 require (
+	github.com/blevesearch/bleve/v2 v2.6.0
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/dgraph-io/ristretto/v2 v2.2.0
-	github.com/rakunlabs/alan v0.3.3
+	github.com/rakunlabs/alan v0.4.1
 	github.com/rakunlabs/query v0.4.6
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	google.golang.org/protobuf v1.36.7
@@ -14,7 +15,6 @@ require (
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
-	github.com/blevesearch/bleve/v2 v2.6.0 // indirect
 	github.com/blevesearch/bleve_index_api v1.3.11 // indirect
 	github.com/blevesearch/geo v0.2.5 // indirect
 	github.com/blevesearch/go-faiss v1.1.0 // indirect

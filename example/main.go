@@ -82,7 +82,9 @@ func main() {
 			if err := users.Insert(ctx, &u); err != nil {
 				return []byte(fmt.Sprintf(`{"error":%q}`, err.Error()))
 			}
-			c.NotifySync()
+			if err := c.NotifySync(ctx); err != nil {
+				log.Printf("[%s] notify sync: %v", nodeName, err)
+			}
 			return []byte(`{"ok":true}`)
 		}),
 	)
@@ -129,10 +131,22 @@ func main() {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"node":    nodeName,
-			"leader":  c.IsLeader(),
-			"version": db.Version(),
+			"node":           nodeName,
+			"leader":         c.IsLeader(),
+			"leader_healthy": c.LeaderHealthy(),
+			"version":        db.Version(),
 		})
+	})
+
+	// GET /healthz - 200 only when this node is leader AND quorum holds.
+	// Useful as a load-balancer readiness probe: a partitioned leader
+	// fails the check and stops receiving traffic.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if !c.LeaderHealthy() {
+			http.Error(w, "not leader or no quorum", http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ok"))
 	})
 
 	srv := &http.Server{Addr: ":" + httpPort, Handler: mux}
