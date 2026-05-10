@@ -48,16 +48,21 @@ func (db *DB) BackupUntil(w io.Writer, until uint64) (uint64, error) {
 	return streamBackup(stream, w)
 }
 
-// Restore loads a backup from the given reader, replacing the current database
-// contents. The reader should contain data previously written by Backup or
-// BackupUntil.
+// Restore loads a backup from the given reader, replacing the current
+// database contents. The reader should contain data previously written
+// by Backup or BackupUntil.
+//
+// Full-text search state is stored as ordinary Badger keys under the
+// \x00fts\x00 namespace (see keys.go), so the backup stream carries
+// FTS postings, doc lengths, and corpus stats alongside data. Restore
+// is therefore portable to any directory: the receiving DB sees the
+// same view of every Bucket[T].Search the source produced. No rebuild
+// step is required.
 func (db *DB) Restore(r io.Reader) error {
 	if err := db.bdb.Load(r, maxPendingWrites); err != nil {
 		return err
 	}
-
 	slog.Info("restored database")
-
 	return nil
 }
 

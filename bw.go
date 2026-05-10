@@ -23,8 +23,9 @@ import (
 type DB struct {
 	bdb   *badger.DB
 	codec codec.Codec
-	path  string       // filesystem path; empty for in-memory databases
-	fts   *ftsRegistry // full-text search indexes
+	path  string          // filesystem path; empty for in-memory databases
+	fts   *ftsRegistry    // full-text search indexes
+	vec   *vectorRegistry // vector search indexes
 }
 
 // Open opens (or creates) a bw database at the given filesystem path.
@@ -70,19 +71,23 @@ func Open(path string, opts ...Option) (*DB, error) {
 		codec: o.codec,
 		path:  dbPath,
 		fts:   newFTSRegistry(),
+		vec:   newVectorRegistry(),
 	}, nil
 }
 
-// Close closes the underlying Badger database and all FTS indexes.
+// Close closes the underlying Badger database. The full-text-search
+// and vector indexes live entirely as Badger keys, so there is nothing
+// else to release.
 func (db *DB) Close() error {
 	if db == nil || db.bdb == nil {
 		return nil
 	}
-
 	if db.fts != nil {
 		db.fts.closeAll()
 	}
-
+	if db.vec != nil {
+		db.vec.closeAll()
+	}
 	return db.bdb.Close()
 }
 
@@ -107,11 +112,6 @@ func (db *DB) Badger() *badger.DB { return db.bdb }
 //   - DropAll blocks all writes for the duration of the wipe.
 //   - DropAll is NOT safe to run concurrently with reads. Quiesce all
 //     RPCs that touch the DB before calling Wipe.
-//   - The FTS reset closes and removes each per-bucket Bleve index
-//     directory before re-opening a fresh one. If the reopen fails
-//     the bucket's FTS index remains nil and subsequent FTS writes
-//     return an error until the process is restarted (which calls
-//     RegisterBucket again).
 func (db *DB) Wipe() error {
 	if db == nil || db.bdb == nil {
 		return nil
@@ -119,8 +119,17 @@ func (db *DB) Wipe() error {
 	if err := db.bdb.DropAll(); err != nil {
 		return err
 	}
+	// FTS and vector state live as Badger keys, so DropAll has
+	// already removed them. The registry resets here are kept for
+	// symmetry and as a hook for future implementations that may
+	// hold off-Badger state.
 	if db.fts != nil {
 		if err := db.fts.resetAll(db); err != nil {
+			return err
+		}
+	}
+	if db.vec != nil {
+		if err := db.vec.resetAll(db); err != nil {
 			return err
 		}
 	}

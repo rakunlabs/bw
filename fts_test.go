@@ -38,6 +38,7 @@ func TestSearch_Basic(t *testing.T) {
 		}
 	}
 
+
 	// Search for "Go"
 	results, total, err := bucket.Search(ctx, "Go", 10, 0)
 	if err != nil {
@@ -79,6 +80,7 @@ func TestSearch_AfterDelete(t *testing.T) {
 	ctx := context.Background()
 	_ = bucket.Insert(ctx, &Article{ID: "1", Title: "Unique Snowflake", Body: "This document is very unique."})
 
+
 	// Should find it
 	results, _, err := bucket.Search(ctx, "Snowflake", 10, 0)
 	if err != nil {
@@ -92,6 +94,7 @@ func TestSearch_AfterDelete(t *testing.T) {
 	if err := bucket.Delete(ctx, "1"); err != nil {
 		t.Fatal(err)
 	}
+
 
 	results, _, err = bucket.Search(ctx, "Snowflake", 10, 0)
 	if err != nil {

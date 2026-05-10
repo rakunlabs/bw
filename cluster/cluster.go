@@ -290,18 +290,101 @@ func (c *Cluster) LeaderHealthy() bool { return c.alan.LeaderHealthy(c.lockKey) 
 // LeaderAddr returns the last-known leader address, or nil if unknown.
 func (c *Cluster) LeaderAddr() *net.UDPAddr { return c.leaderAddr.Load() }
 
+// Status is a point-in-time snapshot of this node's view of the cluster.
+//
+// It is assembled from atomic loads and alan accessors; values for different
+// fields may technically come from slightly different instants, but each
+// individual field is consistent. Use this for status endpoints, readiness
+// probes, and operator tooling — not for correctness-critical decisions
+// (use [Cluster.IsLeader] / [Cluster.LeaderHealthy] for those).
+type Status struct {
+	// IsLeader is true when this node currently holds the leader lock.
+	IsLeader bool
+	// LeaderHealthy is true when this node is the leader AND the cluster
+	// still has quorum. Always false on followers.
+	LeaderHealthy bool
+	// LeaderAddr is the last-known address of the leader, or nil if
+	// unknown (e.g. the leader peer just left and no announce has been
+	// received yet). On the leader this is nil — use LocalAddr instead.
+	LeaderAddr *net.UDPAddr
+	// LocalAddr is this node's own listening address (nil before alan
+	// has finished starting).
+	LocalAddr net.Addr
+	// PeerCount is the number of peers currently visible to alan
+	// (does NOT include this node).
+	PeerCount int
+	// Peers is the list of peer addresses currently visible to alan.
+	// Each entry is the address of one OTHER node — this node is not
+	// included. May be nil/empty if no peers have been discovered.
+	Peers []*net.UDPAddr
+	// QuorumSize is the number of nodes (including this one) required
+	// for the cluster to make progress.
+	QuorumSize int
+	// HasQuorum is true when alan currently sees at least QuorumSize
+	// nodes (including itself).
+	HasQuorum bool
+	// Version is the local database version. On the leader this is the
+	// authoritative version; on followers this is what they have
+	// successfully restored so far.
+	Version uint64
+	// LockKey is the distributed lock name used for leader election.
+	LockKey string
+}
+
+// Status returns a snapshot of this node's view of the cluster: peer
+// count, peer addresses, leader/quorum information, and local DB version.
+//
+// Safe to call from any goroutine and at any time (even before [Cluster.Start]
+// has finished, though peer-related fields will be empty until alan is up).
+func (c *Cluster) Status() Status {
+	return Status{
+		IsLeader:      c.isLeader.Load(),
+		LeaderHealthy: c.alan.LeaderHealthy(c.lockKey),
+		LeaderAddr:    c.leaderAddr.Load(),
+		LocalAddr:     c.alan.LocalAddr(),
+		PeerCount:     c.alan.PeerCount(),
+		Peers:         c.alan.Peers(),
+		QuorumSize:    c.alan.QuorumSize(),
+		HasQuorum:     c.alan.HasQuorum(),
+		Version:       c.db.Version(),
+		LockKey:       c.lockKey,
+	}
+}
+
+// String renders the status in a single human-readable line, suitable for
+// log lines or a CLI `status` subcommand.
+func (s Status) String() string {
+	role := "follower"
+	if s.IsLeader {
+		role = "leader"
+		if !s.LeaderHealthy {
+			role = "leader(unhealthy)"
+		}
+	}
+	leader := "unknown"
+	if s.LeaderAddr != nil {
+		leader = s.LeaderAddr.String()
+	} else if s.IsLeader && s.LocalAddr != nil {
+		leader = s.LocalAddr.String() + " (self)"
+	}
+	peerStrs := make([]string, 0, len(s.Peers))
+	for _, p := range s.Peers {
+		peerStrs = append(peerStrs, p.String())
+	}
+	return fmt.Sprintf(
+		"role=%s version=%d leader=%s peers=%d/%d quorum=%t [%s]",
+		role, s.Version, leader, s.PeerCount, s.QuorumSize, s.HasQuorum,
+		strings.Join(peerStrs, ", "),
+	)
+}
+
 func (c *Cluster) streamType() string { return c.prefix + streamSuffix }
 
 // Start initializes the cluster: starts alan (unless [WithExternalAlan]),
 // begins leader election, and launches the periodic sync loop.
 func (c *Cluster) Start(ctx context.Context) error {
-	if err := c.alan.Handle(c.prefix, c.handleMsg); err != nil {
-		return fmt.Errorf("cluster: handle %q: %w", c.prefix, err)
-	}
-	if err := c.alan.HandleStream(c.streamType(), c.handleStream); err != nil {
-		c.alan.Remove(c.prefix)
-		return fmt.Errorf("cluster: handle stream %q: %w", c.streamType(), err)
-	}
+	c.alan.Handle(c.prefix, c.handleMsg)
+	c.alan.HandleStream(c.streamType(), c.handleStream)
 
 	if !c.externalAlan {
 		errCh := make(chan error, 1)

@@ -7,8 +7,8 @@ import (
 // Tx is a transaction handle wrapping a *badger.Txn.
 //
 // Use db.View(fn) for a read-only transaction or db.Update(fn) for a
-// read-write transaction. db.Begin/BeginRead are also available for users
-// who need finer control over the lifecycle.
+// read-write transaction. db.Begin/BeginRead are also available for
+// users who need finer control over the lifecycle.
 type Tx struct {
 	db   *DB
 	btx  *badger.Txn
@@ -21,17 +21,15 @@ type Tx struct {
 func (db *DB) View(fn func(tx *Tx) error) error {
 	return db.bdb.View(func(btx *badger.Txn) error {
 		tx := &Tx{db: db, btx: btx, rw: false}
-
 		return fn(tx)
 	})
 }
 
-// Update runs fn inside a read-write transaction. If fn returns nil, the
-// transaction is committed; otherwise it is discarded.
+// Update runs fn inside a read-write transaction. If fn returns nil,
+// the transaction is committed; otherwise it is discarded.
 func (db *DB) Update(fn func(tx *Tx) error) error {
 	return db.bdb.Update(func(btx *badger.Txn) error {
 		tx := &Tx{db: db, btx: btx, rw: true}
-
 		return fn(tx)
 	})
 }
@@ -57,10 +55,8 @@ func (tx *Tx) Commit() error {
 
 	if !tx.rw {
 		tx.btx.Discard()
-
 		return nil
 	}
-
 	return tx.btx.Commit()
 }
 

@@ -88,12 +88,96 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 		}
 	}
 
-	// Perform incremental migration.
-	if err := db.migrateBucketIncremental(name, s, b.version, b); err != nil {
+	// Skip the incremental rebuild when the stored fingerprint already
+	// matches: rewriting identical metadata would still bump Badger's
+	// MaxVersion on every call.
+	skip, err := db.fingerprintMatches(name, s)
+	if err != nil {
 		return nil, err
+	}
+	if !skip {
+		if err := db.migrateBucketIncremental(name, s, b.version, b); err != nil {
+			return nil, err
+		}
+	}
+
+	// Open (or reuse) the FTS handle so callers that switched
+	// RegisterBucket -> MigrateBucket on a schema change still get
+	// a working Search.
+	ftsFields := s.FTSFields()
+	if len(ftsFields) > 0 {
+		if existing := db.fts.get(name); existing != nil {
+			b.ftsIdx = existing
+		} else {
+			fi, ferr := openFTSIndex(db, name, ftsFields)
+			if ferr != nil {
+				return nil, ferr
+			}
+			b.ftsIdx = fi
+			db.fts.set(name, fi)
+		}
+	}
+
+	// Same for vector field, if any.
+	vecFields := s.VectorFields()
+	if len(vecFields) > 0 {
+		if existing := db.vec.get(name); existing != nil {
+			b.vecIdx = existing
+		} else {
+			vi, verr := openVectorIndex(db, name, vecFields)
+			if verr != nil {
+				return nil, verr
+			}
+			b.vecIdx = vi
+			db.vec.set(name, vi)
+		}
 	}
 
 	return b, nil
+}
+
+// fingerprintMatches reports whether the bucket's stored schema
+// fingerprint and manifest already match what s describes. It is used
+// by callers (e.g. MigrateBucket) that want to short-circuit a rebuild
+// when nothing has actually changed.
+func (db *DB) fingerprintMatches(bucket string, s *schema.Schema) (bool, error) {
+	want := s.Fingerprint()
+	wantManifest, _ := json.Marshal(buildManifest(s))
+
+	var match bool
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		item, err := btx.Get(metaKey(bucket))
+		if err != nil {
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return nil
+			}
+			return err
+		}
+		got, vErr := item.ValueCopy(nil)
+		if vErr != nil {
+			return vErr
+		}
+		if string(got) != want {
+			return nil
+		}
+		manItem, mErr := btx.Get(manifestKey(bucket))
+		if mErr != nil {
+			if errors.Is(mErr, badger.ErrKeyNotFound) {
+				return nil
+			}
+			return mErr
+		}
+		gotMan, mvErr := manItem.ValueCopy(nil)
+		if mvErr != nil {
+			return mvErr
+		}
+		if string(gotMan) != string(wantManifest) {
+			return nil
+		}
+		match = true
+		return nil
+	})
+	return match, err
 }
 
 // fieldManifestEntry describes one indexed/unique field for diffing.
@@ -333,10 +417,20 @@ func (db *DB) ensureSchemaOrMigrate(bucket string, s *schema.Schema, version uin
 	want := s.Fingerprint()
 	mkey := metaKey(bucket)
 	vkey := versionKey(bucket)
+	manKey := manifestKey(bucket)
 
-	var needsMigration bool
+	wantManifest, _ := json.Marshal(buildManifest(s))
 
-	// Check fingerprint.
+	var (
+		needsMigration   bool
+		writeFingerprint bool
+		writeVersion     bool
+		writeManifest    bool
+	)
+
+	// Inspect existing metadata. We only schedule writes for keys that
+	// are missing or whose value differs — re-writing identical bytes
+	// would still bump Badger's MaxVersion on every process start.
 	err := db.bdb.View(func(btx *badger.Txn) error {
 		item, err := btx.Get(mkey)
 		switch {
@@ -345,32 +439,74 @@ func (db *DB) ensureSchemaOrMigrate(bucket string, s *schema.Schema, version uin
 			if vErr != nil {
 				return vErr
 			}
-			if string(got) == want {
-				return nil // fingerprint matches, no migration needed
+			if string(got) != want {
+				// Fingerprint differs — check if we can auto-migrate.
+				if version == 0 {
+					return fmt.Errorf("bw: schema fingerprint mismatch for bucket %q (have %s, want %s); migrate or pick a new bucket name",
+						bucket, string(got), want)
+				}
+				// Check stored version.
+				var storedVersion uint64
+				if vItem, vErr := btx.Get(vkey); vErr == nil {
+					_ = vItem.Value(func(val []byte) error {
+						if len(val) == 8 {
+							storedVersion = binary.BigEndian.Uint64(val)
+						}
+						return nil
+					})
+				}
+				if version <= storedVersion {
+					return fmt.Errorf("bw: schema fingerprint mismatch for bucket %q but version %d <= stored %d; bump WithVersion to trigger migration",
+						bucket, version, storedVersion)
+				}
+				needsMigration = true
+				return nil
 			}
-			// Fingerprint differs — check if we can auto-migrate.
-			if version == 0 {
-				return fmt.Errorf("bw: schema fingerprint mismatch for bucket %q (have %s, want %s); migrate or pick a new bucket name",
-					bucket, string(got), want)
-			}
-			// Check stored version.
-			var storedVersion uint64
-			if vItem, vErr := btx.Get(vkey); vErr == nil {
-				_ = vItem.Value(func(val []byte) error {
-					if len(val) == 8 {
-						storedVersion = binary.BigEndian.Uint64(val)
+			// Fingerprint matches — check version and manifest for drift.
+			if version > 0 {
+				var storedVersion uint64
+				vItem, vErr := btx.Get(vkey)
+				switch {
+				case vErr == nil:
+					_ = vItem.Value(func(val []byte) error {
+						if len(val) == 8 {
+							storedVersion = binary.BigEndian.Uint64(val)
+						}
+						return nil
+					})
+					if storedVersion != version {
+						writeVersion = true
 					}
-					return nil
-				})
+				case errors.Is(vErr, badger.ErrKeyNotFound):
+					writeVersion = true
+				default:
+					return vErr
+				}
 			}
-			if version <= storedVersion {
-				return fmt.Errorf("bw: schema fingerprint mismatch for bucket %q but version %d <= stored %d; bump WithVersion to trigger migration",
-					bucket, version, storedVersion)
+			manItem, mErr := btx.Get(manKey)
+			switch {
+			case mErr == nil:
+				gotMan, mvErr := manItem.ValueCopy(nil)
+				if mvErr != nil {
+					return mvErr
+				}
+				if string(gotMan) != string(wantManifest) {
+					writeManifest = true
+				}
+			case errors.Is(mErr, badger.ErrKeyNotFound):
+				writeManifest = true
+			default:
+				return mErr
 			}
-			needsMigration = true
 			return nil
 		case errors.Is(err, badger.ErrKeyNotFound):
-			return nil // first registration
+			// First registration — write everything.
+			writeFingerprint = true
+			if version > 0 {
+				writeVersion = true
+			}
+			writeManifest = true
+			return nil
 		default:
 			return err
 		}
@@ -384,23 +520,30 @@ func (db *DB) ensureSchemaOrMigrate(bucket string, s *schema.Schema, version uin
 		return db.migrateBucketIncremental(bucket, s, version, m)
 	}
 
-	// First registration or fingerprint matched — write metadata.
+	// Fast path: fingerprint matched and nothing drifted — no writes,
+	// no MaxVersion bump on subsequent process starts.
+	if !writeFingerprint && !writeVersion && !writeManifest {
+		return nil
+	}
+
 	return db.bdb.Update(func(btx *badger.Txn) error {
-		// Set fingerprint (idempotent if already matches).
-		if err := btx.Set(mkey, []byte(want)); err != nil {
-			return err
+		if writeFingerprint {
+			if err := btx.Set(mkey, []byte(want)); err != nil {
+				return err
+			}
 		}
-		// Set version if provided.
-		if version > 0 {
+		if writeVersion {
 			var buf [8]byte
 			binary.BigEndian.PutUint64(buf[:], version)
 			if err := btx.Set(vkey, buf[:]); err != nil {
 				return err
 			}
 		}
-		// Set manifest.
-		manifest := buildManifest(s)
-		data, _ := json.Marshal(manifest)
-		return btx.Set(manifestKey(bucket), data)
+		if writeManifest {
+			if err := btx.Set(manKey, wantManifest); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }

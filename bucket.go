@@ -2,7 +2,6 @@ package bw
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
@@ -55,6 +54,25 @@ type Bucket[T any] struct {
 	// ftsIdx is the full-text search index for this bucket, or nil when
 	// no FTS-tagged fields exist.
 	ftsIdx *ftsIndex
+
+	// vecIdx is the vector index for this bucket, or nil when no
+	// vector-tagged field exists.
+	vecIdx *vectorIndex
+
+	// embedder, when non-nil, is invoked for every Insert whose
+	// vector field is empty so the caller can ship plain records and
+	// let bw call out to an embedding model.
+	embedder func(ctx context.Context, record any) ([]float32, error)
+
+	// userMigrations is the list of (fromV, toV, applyFn) steps the
+	// caller registered via WithRawMigration / WithTypedMigration /
+	// WithVectorReembed. Applied during RegisterBucket once the
+	// schema-level migration has settled.
+	userMigrations []userMigration
+
+	// migrationProgress is an optional hook fired between batches
+	// during user migration runs. See WithMigrationProgress.
+	migrationProgress MigrationProgress
 }
 
 // BucketOption configures a Bucket at registration time.
@@ -75,6 +93,55 @@ func WithKeyFn[T any](fn func(*T) ([]byte, error)) BucketOption[T] {
 // Bump this number each time you change the struct's index/unique surface.
 func WithVersion[T any](v uint64) BucketOption[T] {
 	return func(b *Bucket[T]) { b.version = v }
+}
+
+// WithVectorParams overrides the HNSW knobs for the bucket's vector
+// field. M is the graph degree (neighbours kept per node, default 16);
+// efConstruction is the candidate-set size used during inserts
+// (default 200). Pass zero to leave the corresponding default in
+// place.
+//
+// Once a vector has been inserted, the values are persisted to the
+// manifest and become immutable — changing them later orphans
+// existing neighbour lists. Pick once, ideally before the first
+// insert.
+func WithVectorParams[T any](M, efConstruction int) BucketOption[T] {
+	return func(b *Bucket[T]) {
+		// Stash on the bucket; openVectorIndex has already been
+		// called by RegisterBucket but b.vecIdx is the one
+		// instance, so we patch its tunables directly. If
+		// vector tag is absent the option is silently ignored.
+		if b.vecIdx == nil {
+			return
+		}
+		if M > 0 {
+			b.vecIdx.wantM = M
+		}
+		if efConstruction > 0 {
+			b.vecIdx.wantEfConstruction = efConstruction
+		}
+	}
+}
+
+// WithEmbedder installs an embedding function that bw calls during
+// Insert when the record's `vector`-tagged field is empty. Returning a
+// non-nil error from the embedder fails the Insert; the data write is
+// rolled back along with any other index maintenance, so partial state
+// is impossible.
+//
+// Records that already carry a populated vector skip the embedder, so
+// callers can mix "auto-embed by text" and "I already computed the
+// vector" calls in the same bucket.
+func WithEmbedder[T any](fn func(ctx context.Context, record *T) ([]float32, error)) BucketOption[T] {
+	return func(b *Bucket[T]) {
+		b.embedder = func(ctx context.Context, rec any) ([]float32, error) {
+			typed, ok := rec.(*T)
+			if !ok {
+				return nil, fmt.Errorf("bw: embedder: record type mismatch")
+			}
+			return fn(ctx, typed)
+		}
+	}
 }
 
 // RegisterBucket parses T's schema and returns a typed Bucket bound to db.
@@ -151,19 +218,53 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		}
 	}
 
-	if err := db.ensureSchemaOrMigrate(name, s, b.version, b); err != nil {
+	// Open the FTS / vector handles up front so user migrations
+	// (which call Insert internally) reach the full maintenance
+	// path. They're cheap config records — no I/O happens until a
+	// write fires.
+	ftsFields := s.FTSFields()
+	if len(ftsFields) > 0 {
+		if existing := db.fts.get(name); existing != nil {
+			b.ftsIdx = existing
+		} else {
+			fi, err := openFTSIndex(db, name, ftsFields)
+			if err != nil {
+				return nil, err
+			}
+			b.ftsIdx = fi
+			db.fts.set(name, fi)
+		}
+	}
+	vecFields := s.VectorFields()
+	if len(vecFields) > 0 {
+		if existing := db.vec.get(name); existing != nil {
+			b.vecIdx = existing
+		} else {
+			vi, err := openVectorIndex(db, name, vecFields)
+			if err != nil {
+				return nil, err
+			}
+			b.vecIdx = vi
+			db.vec.set(name, vi)
+		}
+	}
+
+	// User migrations run BEFORE the schema reconcile step so a
+	// failure leaves the stored fingerprint and version untouched
+	// (callers can re-open with the previous T and read their data
+	// as if no migration had been attempted). Each migration step
+	// advances the bucket's version key as it succeeds, so a
+	// resumed run picks up where the last one stopped.
+	storedV, err := b.readStoredVersion()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := b.runUserMigrations(context.Background(), storedV); err != nil {
 		return nil, err
 	}
 
-	// Open FTS index if any fields are tagged with `fts`.
-	ftsFields := s.FTSFields()
-	if len(ftsFields) > 0 {
-		fi, err := openFTSIndex(db, name, ftsFields)
-		if err != nil {
-			return nil, err
-		}
-		b.ftsIdx = fi
-		db.fts.set(name, fi)
+	if err := db.ensureSchemaOrMigrate(name, s, b.version, b); err != nil {
+		return nil, err
 	}
 
 	return b, nil
@@ -358,9 +459,13 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 	}
 
 	if b.ftsIdx != nil {
-		pkHex := hex.EncodeToString(pk)
-		if err := b.ftsIdx.deleteDoc(pkHex); err != nil {
+		if err := b.ftsIdx.deleteDoc(tx.btx, pk); err != nil {
 			return fmt.Errorf("bw: fts delete: %w", err)
+		}
+	}
+	if b.vecIdx != nil {
+		if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
+			return fmt.Errorf("bw: vector delete: %w", err)
 		}
 	}
 
@@ -426,13 +531,29 @@ func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
 		return err
 	}
 
-	// Update FTS index (outside the Badger txn since Bleve manages its
-	// own storage). This is best-effort: if FTS indexing fails the data
-	// write still succeeds but we surface the error so callers can react.
+	// FTS postings are written inside the same Badger txn as the
+	// data: a rollback discards them, a commit makes them visible
+	// atomically with the record itself.
 	if b.ftsIdx != nil {
-		pkHex := hex.EncodeToString(pk)
-		if err := b.ftsIdx.indexDoc(pkHex, record); err != nil {
-			return fmt.Errorf("bw: fts index: %w", err)
+		if err := b.ftsIdx.writeDoc(tx.btx, pk, record); err != nil {
+			return fmt.Errorf("bw: fts write: %w", err)
+		}
+	}
+
+	// Vector field, same atomicity story.
+	if b.vecIdx != nil {
+		v := b.vecIdx.extractVector(record)
+		if v == nil && b.embedder != nil {
+			ev, eErr := b.embedder(context.Background(), record)
+			if eErr != nil {
+				return fmt.Errorf("bw: embedder: %w", eErr)
+			}
+			v = ev
+		}
+		if v != nil {
+			if err := b.vecIdx.writeVec(tx.btx, pk, v); err != nil {
+				return fmt.Errorf("bw: vector write: %w", err)
+			}
 		}
 	}
 
@@ -537,9 +658,13 @@ func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 		}
 
 		if b.ftsIdx != nil {
-			pkHex := hex.EncodeToString(pk)
-			if err := b.ftsIdx.deleteDoc(pkHex); err != nil {
+			if err := b.ftsIdx.deleteDoc(tx.btx, pk); err != nil {
 				return fmt.Errorf("bw: fts delete: %w", err)
+			}
+		}
+		if b.vecIdx != nil {
+			if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
+				return fmt.Errorf("bw: vector delete: %w", err)
 			}
 		}
 
@@ -792,7 +917,7 @@ func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int)
 		limit = 10
 	}
 
-	hits, total, err := b.ftsIdx.search(query, limit, offset)
+	hits, total, err := b.ftsIdx.search(b.db, query, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("bw: search: %w", err)
 	}
@@ -800,23 +925,22 @@ func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int)
 	results := make([]SearchResult[T], 0, len(hits))
 	err = b.db.View(func(tx *Tx) error {
 		for _, h := range hits {
-			pk, decErr := hex.DecodeString(h.ID)
-			if decErr != nil {
-				continue // skip corrupted entries
-			}
+			pk := []byte(h.ID)
 			item, getErr := tx.btx.Get(dataKey(b.name, pk))
 			if getErr != nil {
-				continue // record may have been deleted
+				if errors.Is(getErr, badger.ErrKeyNotFound) {
+					continue
+				}
+				return getErr
 			}
 			rec := new(T)
 			if err := item.Value(func(val []byte) error {
 				return b.codec.Unmarshal(val, rec)
 			}); err != nil {
-				continue
+				return err
 			}
 			results = append(results, SearchResult[T]{Record: rec, Score: h.Score})
 		}
-
 		return nil
 	})
 	if err != nil {
@@ -824,4 +948,94 @@ func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int)
 	}
 
 	return results, total, nil
+}
+
+// SearchVector returns the top-K records whose vector field is closest
+// to q under the configured distance metric. The bucket must declare a
+// `vector`-tagged field at registration time; otherwise [ErrNoVector]
+// is returned. Stage A implementation is brute-force over all
+// non-deleted vectors; recall is exact.
+//
+// opts is variadic for ergonomics: SearchVector(ctx, q) takes the
+// schema defaults (K=10, schema metric, no filter). Pass at most one
+// SearchVectorOptions to override.
+//
+// When opts.Filter is non-nil it must be a *query.Query; the bucket
+// resolves it via the ordinary Find path (so any indexable predicate
+// the planner understands is fast) and the vector pass only sees pks
+// that survived the filter.
+func (b *Bucket[T]) SearchVector(ctx context.Context, q []float32, opts ...SearchVectorOptions) ([]VectorHit[T], error) {
+	_ = ctx
+
+	if b.vecIdx == nil {
+		return nil, ErrNoVector
+	}
+	if len(q) == 0 {
+		return nil, ErrVectorEmpty
+	}
+
+	var so SearchVectorOptions
+	if len(opts) > 0 {
+		so = opts[0]
+	}
+	if so.K <= 0 {
+		so.K = 10
+	}
+	metric := so.Metric
+	if metric == MetricDefault {
+		metric = b.vecIdx.defaultM
+	}
+
+	// Resolve the filter into a pk allow-set when present. We use
+	// the typed Find path so indexed predicates are cheap.
+	var allowed map[string]struct{}
+	if so.Filter != nil {
+		qq, ok := so.Filter.(*query.Query)
+		if !ok {
+			return nil, fmt.Errorf("bw: SearchVector Filter must be *query.Query, got %T", so.Filter)
+		}
+		matches, err := b.Find(ctx, qq)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, nil
+		}
+		allowed = make(map[string]struct{}, len(matches))
+		for _, m := range matches {
+			pk, kerr := b.keyFn(m)
+			if kerr != nil {
+				return nil, kerr
+			}
+			allowed[string(pk)] = struct{}{}
+		}
+	}
+
+	out := make([]VectorHit[T], 0, so.K)
+	err := b.vecIdx.search(b.db, q, so.K, so.EfSearch, metric, allowed, func(pk []byte, score float64) error {
+		// Hydrate the record. Use a fresh read txn per call rather
+		// than a shared one so search results stay close to the
+		// committed view at the moment SearchVector returned.
+		return b.db.View(func(tx *Tx) error {
+			item, gErr := tx.btx.Get(dataKey(b.name, pk))
+			if gErr != nil {
+				if errors.Is(gErr, badger.ErrKeyNotFound) {
+					return nil
+				}
+				return gErr
+			}
+			rec := new(T)
+			if vErr := item.Value(func(val []byte) error {
+				return b.codec.Unmarshal(val, rec)
+			}); vErr != nil {
+				return vErr
+			}
+			out = append(out, VectorHit[T]{Record: rec, Score: score})
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("bw: vector search: %w", err)
+	}
+	return out, nil
 }

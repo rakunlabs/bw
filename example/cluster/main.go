@@ -37,7 +37,7 @@ func main() {
 	httpPort := envOr("HTTP_PORT", "8080")
 	alanPort := envOrInt("ALAN_PORT", 5000)
 	alanBindAddr := envOr("ALAN_BIND_ADDR", "127.0.1.1")
-	peers := envOr("PEERS", "alan-chat.local")
+	peers := envOr("PEERS", "alan.local")
 	replicas := envOrInt("REPLICAS", 2)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

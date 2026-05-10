@@ -46,6 +46,17 @@ type Field struct {
 	// FTS is true if a full-text search index should be maintained on
 	// this field (only string fields are supported).
 	FTS bool
+	// Vector is true if a vector index should be maintained on this
+	// field (only []float32 is supported).
+	Vector bool
+	// VectorDim is the embedding dimensionality. Zero means
+	// "auto-detect on first insert"; once set in the bucket manifest
+	// it is immutable for the lifetime of the bucket.
+	VectorDim int
+	// VectorMetric is the distance function used at search time.
+	// Empty string means "use the bucket default" (cosine).
+	// Recognised values: "cosine", "dot", "l2".
+	VectorMetric string
 }
 
 // CompositeGroup describes a named group of fields that form a composite
@@ -105,6 +116,15 @@ func (s *Schema) Fingerprint() string {
 		if f.FTS {
 			flags += "F"
 		}
+		if f.Vector {
+			flags += "V"
+			if f.VectorDim > 0 {
+				flags += fmt.Sprintf(":d=%d", f.VectorDim)
+			}
+			if f.VectorMetric != "" {
+				flags += ":m=" + f.VectorMetric
+			}
+		}
 		rows = append(rows, entry{Name: f.Name, Flags: flags})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
@@ -151,6 +171,17 @@ func (s *Schema) FTSFields() []*Field {
 		}
 	}
 
+	return out
+}
+
+// VectorFields returns the subset of Fields tagged with `vector`.
+func (s *Schema) VectorFields() []*Field {
+	out := make([]*Field, 0)
+	for _, f := range s.Fields {
+		if f.Vector {
+			out = append(out, f)
+		}
+	}
 	return out
 }
 
@@ -291,7 +322,7 @@ func walkStruct(t reflect.Type, indexPrefix []int, s *Schema) error {
 		}
 
 		if hasTag {
-			parts := strings.Split(raw, ",")
+			parts := splitTagFlags(raw)
 			if name := strings.TrimSpace(parts[0]); name != "" {
 				f.Name = name
 			}
@@ -312,6 +343,14 @@ func walkStruct(t reflect.Type, indexPrefix []int, s *Schema) error {
 					f.UniqueGroup = strings.TrimPrefix(flag, "unique:")
 				case flag == "fts":
 					f.FTS = true
+				case flag == "vector":
+					f.Vector = true
+				case strings.HasPrefix(flag, "vector(") && strings.HasSuffix(flag, ")"):
+					f.Vector = true
+					params := flag[len("vector(") : len(flag)-1]
+					if err := parseVectorParams(params, f); err != nil {
+						return fmt.Errorf("schema %s: field %s: %w", t.Name(), sf.Name, err)
+					}
 				case flag == "":
 					// trailing comma, ignore
 				default:
@@ -376,4 +415,93 @@ func (s *Schema) FieldValue(record any, name string) (reflect.Value, bool) {
 	}
 
 	return rv.FieldByIndex(f.Index), true
+}
+
+// splitTagFlags splits a `bw:"…"` tag body on commas, but skips
+// commas that appear inside balanced parentheses. This lets a single
+// flag carry its own comma-separated parameter list, e.g.
+// `bw:"embed,vector(dim=4,metric=cosine)"`.
+func splitTagFlags(raw string) []string {
+	var (
+		parts []string
+		buf   strings.Builder
+		depth int
+	)
+	for _, r := range raw {
+		switch r {
+		case '(':
+			depth++
+			buf.WriteRune(r)
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			buf.WriteRune(r)
+		case ',':
+			if depth == 0 {
+				parts = append(parts, buf.String())
+				buf.Reset()
+				continue
+			}
+			buf.WriteRune(r)
+		default:
+			buf.WriteRune(r)
+		}
+	}
+	parts = append(parts, buf.String())
+	return parts
+}
+
+// parseVectorParams parses the "key=value,key=value" body of a
+// vector(...) tag flag and writes it to f. Recognised keys: dim,
+// metric. Unknown keys produce a tag-parse error so typos are caught
+// at registration rather than silently ignored.
+func parseVectorParams(params string, f *Field) error {
+	if params == "" {
+		return nil
+	}
+	for _, kv := range strings.Split(params, ",") {
+		kv = strings.TrimSpace(kv)
+		if kv == "" {
+			continue
+		}
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			return fmt.Errorf("vector param %q must be key=value", kv)
+		}
+		key := strings.TrimSpace(kv[:eq])
+		val := strings.TrimSpace(kv[eq+1:])
+		switch key {
+		case "dim":
+			n, err := parseUint(val)
+			if err != nil || n == 0 {
+				return fmt.Errorf("vector dim %q: must be positive integer", val)
+			}
+			f.VectorDim = n
+		case "metric":
+			switch val {
+			case "cosine", "dot", "l2":
+				f.VectorMetric = val
+			default:
+				return fmt.Errorf("vector metric %q: want cosine|dot|l2", val)
+			}
+		default:
+			return fmt.Errorf("vector param %q: unknown key", key)
+		}
+	}
+	return nil
+}
+
+func parseUint(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not a number")
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
 }
