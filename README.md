@@ -192,6 +192,64 @@ bw.DefaultLogSize   int64 = 100 << 20   // 100 MiB value-log file size (Badger d
 These are package-level vars. Either change them at process start or use
 `WithBadgerOptions` to take full control.
 
+### Tuning individual Badger fields
+
+If you only need to change a few Badger fields (`NumVersionsToKeep`,
+`NumGoroutines`, `NumCompactors`, etc.) without rebuilding the whole
+`badger.Options`, use `WithBadgerTune`. It hands you a `*badger.Options`
+that already has bw's defaults (the lighter cache/log sizes above) and
+the `path` argument applied — you only supply the delta:
+
+```go
+db, err := bw.Open("/var/lib/myapp",
+    bw.WithBadgerTune(func(bo *badger.Options) {
+        bo.NumVersionsToKeep = 3
+        bo.NumGoroutines     = 8
+        bo.NumCompactors     = 4
+    }),
+)
+```
+
+Badger's `With*` methods use value receivers, so the chained form must
+be reassigned through the pointer:
+
+```go
+bw.WithBadgerTune(func(bo *badger.Options) {
+    *bo = bo.WithNumVersionsToKeep(3).WithNumGoroutines(8)
+})
+```
+
+`WithBadgerTune` runs on top of whichever base was chosen (path,
+`WithInMemory`, or a full `WithBadgerOptions` override), so it composes
+with all three. The logger from `WithLogger` is reapplied AFTER the
+tune callback, so set the logger via `WithLogger` rather than mutating
+`bo.Logger` inside the tune.
+
+| Option | When to reach for it |
+| --- | --- |
+| `WithBadgerTune(fn)` | Tweak a few badger fields on top of bw's defaults — keeps `path`, cache/log sizes, etc. |
+| `WithBadgerOptions(bo)` | Take full control. `path` is ignored, bw defaults are skipped. |
+| `bw.DefaultCacheSize` / `DefaultLogSize` | Change bw's process-wide defaults before any `Open` call. |
+
+The most commonly tuned Badger fields and the values you see inside the
+tune callback before you touch anything (effective defaults: Badger's
+own values, with bw overriding only `BlockCacheSize` and
+`ValueLogFileSize`):
+
+| Field | Effective default | What it controls |
+| --- | --- | --- |
+| `BlockCacheSize` | `100 << 20` (100 MiB) — **bw override** (Badger: 256 MiB) | LSM block cache size in bytes |
+| `ValueLogFileSize` | `100 << 20` (100 MiB) — **bw override** (Badger: 1 GiB) | Max value-log file size before rollover |
+| `NumVersionsToKeep` | `1` | Versions kept per key (raise for time-travel / longer incremental backups) |
+| `NumGoroutines` | `8` | Worker pool size used by `Stream` (backup, GC, etc.) |
+| `NumCompactors` | `4` | Concurrent LSM compaction workers (one dedicated to L0→L1) |
+| `NumMemtables` | `5` | In-memory tables kept before stalling writes |
+| `NumLevelZeroTables` | `5` | L0 tables before compaction kicks in |
+| `NumLevelZeroTablesStall` | `15` | L0 tables before writes stall |
+| `Logger` | `bw.newLogger()` — **bw override** | Use `WithLogger` instead; tune-time changes get overwritten |
+
+Run `go doc github.com/dgraph-io/badger/v4.Options` for the full list.
+
 ---
 
 ## Query syntax
@@ -374,6 +432,74 @@ func main() {
 | `WithOnLeaderChange(fn)` | `nil` | Callback when leadership changes |
 | `WithPrefix(s)` | `"bw"` | Message namespace prefix (see below) |
 | `WithForwardHandler(fn)` | `nil` | Handler for forwarded requests on the leader |
+| `WithDBName(name)` | `"default"` | Name registered for the primary DB passed to `New` (see multi-DB below) |
+| `WithExternalAlan()` | off | Alan's lifecycle is managed by the caller; `Stop` only deregisters handlers |
+
+### Multiple databases under one cluster
+
+A single `Cluster` can manage **more than one** `*bw.DB` under one leader
+election. Each database is registered under a unique name (1..255 bytes),
+and the wire protocol carries that name in every per-DB message so peers
+route the diff into the matching database. Leader election remains
+global — whichever node holds the lock is the leader for every
+registered DB — but version probing, catch-up, and pushes run in
+parallel per DB, so a slow database does not stall the others.
+
+```go
+users,  _ := bw.Open("/var/lib/myapp/users")
+orders, _ := bw.Open("/var/lib/myapp/orders")
+defer users.Close()
+defer orders.Close()
+
+// Primary DB is passed to New and named via WithDBName; additional
+// DBs are attached with AddDB.
+c := cluster.New(users, a,
+    cluster.WithLockKey("myapp-leader"),
+    cluster.WithDBName("users"),
+)
+if err := c.AddDB("orders", orders); err != nil {
+    log.Fatal(err)
+}
+if err := c.Start(ctx); err != nil { log.Fatal(err) }
+defer c.Stop()
+
+// Sync everything in parallel after a multi-DB write...
+_ = c.NotifySync(ctx)
+
+// ...or scope the broadcast to one DB when only that one changed:
+_ = c.NotifySyncDB(ctx, "users")
+
+// Status carries per-DB versions.
+for name, ver := range c.Status().Versions {
+    log.Printf("%s @ v%d", name, ver)
+}
+```
+
+Helpers:
+
+| Method | Description |
+| --- | --- |
+| `AddDB(name, db) error` | Register an additional DB. Safe to call before or after `Start`. |
+| `DBByName(name) *bw.DB` | Look up a registered DB, or `nil` if the name is unknown. |
+| `DBNames() []string` | Sorted snapshot of every registered DB name. |
+| `NotifySyncDB(ctx, name) error` | Push the diff for a single named DB; returns `ErrUnknownDB` if not registered. |
+| `Status().Versions` | `map[string]uint64` of every DB's local version. |
+
+**Rules of the road:**
+
+- Every node in the cluster MUST register the same set of DB names.
+  A peer that doesn't know a name replies with version `0` and gets
+  silently skipped by the leader — it will be permanently stale on
+  that DB until you fix the configuration.
+- DB names must be 1..255 bytes (single-byte length prefix on the wire).
+- `Forward` is DB-agnostic: the cluster does not inspect the payload, so
+  if your handler can touch multiple DBs encode that routing yourself
+  (for example, prefix the payload with a one-byte tag). See
+  [`example/cluster/main.go`](example/cluster/main.go) for a working
+  two-DB demo.
+- If you prefer fully separate leader elections per DB, use multiple
+  `Cluster` instances with distinct `WithLockKey` and `WithPrefix`
+  instead — share one alan via `WithExternalAlan()`.
 
 ### Message prefix
 
@@ -384,9 +510,19 @@ collide. Every cluster message is prefixed with a namespace string
 ignored.
 
 ```go
-// Two independent clusters on the same alan instance:
-c1 := cluster.New(db1, a, cluster.WithPrefix("users"))
-c2 := cluster.New(db2, a, cluster.WithPrefix("orders"))
+// Two independent clusters on the same alan instance — each with its
+// own leader election. For one cluster that manages several DBs under
+// a single election, see "Multiple databases under one cluster" above.
+c1 := cluster.New(db1, a,
+    cluster.WithPrefix("users"),
+    cluster.WithLockKey("users-leader"),
+    cluster.WithExternalAlan(),
+)
+c2 := cluster.New(db2, a,
+    cluster.WithPrefix("orders"),
+    cluster.WithLockKey("orders-leader"),
+    cluster.WithExternalAlan(),
+)
 ```
 
 ### Forwarding writes to the leader

@@ -32,7 +32,9 @@ type DB struct {
 //
 // If options include WithBadgerOptions, the embedded badger options take
 // precedence and path is ignored. WithInMemory(true) overrides path and
-// the badger options' Dir/ValueDir.
+// the badger options' Dir/ValueDir. WithBadgerTune runs last and lets
+// the caller mutate individual fields on top of whichever base was
+// chosen.
 func Open(path string, opts ...Option) (*DB, error) {
 	o := &options{
 		codec:  codec.MsgPack(),
@@ -52,6 +54,13 @@ func Open(path string, opts ...Option) (*DB, error) {
 		bo = *o.badger
 	default:
 		bo = applyDefaults(badger.DefaultOptions(path))
+	}
+
+	// Apply user-supplied per-field tuning on top of the base options
+	// (path, in-memory, or full override). Runs before WithLogger so
+	// the logger choice from WithLogger always wins.
+	if o.badgerFn != nil {
+		o.badgerFn(&bo)
 	}
 
 	bo = bo.WithLogger(o.logger)

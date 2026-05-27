@@ -26,10 +26,11 @@ var (
 type Option func(*options)
 
 type options struct {
-	codec  codec.Codec
-	badger *badger.Options
-	logger badger.Logger
-	inMem  *bool
+	codec    codec.Codec
+	badger   *badger.Options
+	badgerFn func(*badger.Options)
+	logger   badger.Logger
+	inMem    *bool
 }
 
 // WithCodec sets the codec used to serialize record values.
@@ -45,6 +46,39 @@ func WithCodec(c codec.Codec) Option {
 // also ignored in favour of bo.Dir / bo.ValueDir.
 func WithBadgerOptions(bo badger.Options) Option {
 	return func(o *options) { o.badger = &bo }
+}
+
+// WithBadgerTune lets the caller tweak individual badger.Options fields
+// after bw has assembled its own defaults. Unlike [WithBadgerOptions],
+// this preserves the path argument to Open and keeps bw's lighter
+// DefaultCacheSize / DefaultLogSize in place; the caller only supplies
+// a delta.
+//
+// The function is invoked AFTER the base options are built (whether
+// from path, in-memory mode, or a wholesale [WithBadgerOptions]
+// override) and BEFORE the logger from [WithLogger] is reapplied, so
+// any change to bo.Logger here will be overwritten — use [WithLogger]
+// for logger changes.
+//
+// Example — direct field assignment (recommended):
+//
+//	db, _ := bw.Open("/var/lib/foo", bw.WithBadgerTune(func(bo *badger.Options) {
+//	    bo.NumVersionsToKeep = 3
+//	    bo.NumGoroutines     = 8
+//	    bo.NumCompactors     = 4
+//	}))
+//
+// Badger's With* methods return a new Options value (value receivers),
+// so if you prefer the chained form you must reassign through the
+// pointer:
+//
+//	bw.WithBadgerTune(func(bo *badger.Options) {
+//	    *bo = bo.WithNumVersionsToKeep(3).WithNumGoroutines(8)
+//	})
+//
+// Passing nil is allowed and is a no-op.
+func WithBadgerTune(fn func(*badger.Options)) Option {
+	return func(o *options) { o.badgerFn = fn }
 }
 
 // WithLogger sets the badger.Logger. Pass nil to silence Badger entirely.
