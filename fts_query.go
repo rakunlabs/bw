@@ -225,19 +225,41 @@ func parseQuery(tk Tokenizer, s string) parsedQuery {
 			appendPositive(queryClause{kind: clausePrefix, term: norm}, rt.negated)
 		default:
 			// A bare word may itself tokenize into several terms (e.g.
-			// "v0.39.0" -> v0.39.0 plus sub-tokens). Use the whole-token
-			// form when the tokenizer emits a compound, else AND the parts.
-			toks := tk.Tokenize(rt.text)
-			switch len(toks) {
+			// "v0.39.0" -> v0.39.0 plus sub-tokens, or "transaction_shared"
+			// -> transaction, shared, transaction_shared).
+			pts := tokenizePositions(tk, rt.text)
+			switch len(pts) {
 			case 0:
 				continue
 			case 1:
-				appendPositive(queryClause{kind: clauseTerm, term: toks[0]}, rt.negated)
+				appendPositive(queryClause{kind: clauseTerm, term: pts[0].Term}, rt.negated)
 			default:
-				// Prefer the longest token (the compound "emit both"
-				// whole form) as a single exact clause so "v0.39.0"
-				// matches precisely; the sub-tokens are redundant.
-				appendPositive(queryClause{kind: clauseTerm, term: longestToken(toks)}, rt.negated)
+				// The word is a compound. Match it two ways, ORed:
+				//   1. the whole "emit both" compound token as an exact
+				//      term, so "v0.39.0" matches precisely and legacy
+				//      postings without positions still work; and
+				//   2. the ordered sub-fragments as a phrase, so a word
+				//      that only ever appears embedded in a longer path
+				//      (e.g. "transaction_shared" inside
+				//      ".../transaction_shared.git", which is only indexed
+				//      as the leaf fragments plus the full path) is still
+				//      found via its adjacent fragments.
+				exact := queryClause{kind: clauseTerm, term: longestToken(tokenStrings(pts))}
+				phrase, distinct := phraseTokens(pts)
+				if distinct <= 1 {
+					appendPositive(exact, rt.negated)
+					break
+				}
+				alt := queryClause{kind: clausePhrase, phrase: phrase}
+				if rt.negated || pendOR {
+					// Negation and OR-chaining operate on a single clause;
+					// fall back to the exact compound to keep grouping
+					// semantics simple and predictable.
+					appendPositive(exact, rt.negated)
+					break
+				}
+				pq.orGroups = append(pq.orGroups, []queryClause{exact, alt})
+				haveLast = false
 			}
 		}
 	}

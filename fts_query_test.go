@@ -88,6 +88,54 @@ func TestSearch_VersionExactAndFragment(t *testing.T) {
 	}
 }
 
+// TestSearch_EmbeddedCompound is the reported case: a compound
+// identifier ("transaction_shared") that only ever appears embedded in a
+// longer path must still be found by its bare compound query, while a
+// query for the full path keeps working and unrelated docs are excluded.
+func TestSearch_EmbeddedCompound(t *testing.T) {
+	b := newDepBucket(t,
+		&Dep{ID: "hit", Path: "go.mod", Body: "git.example.com/acme/services/transactions/transaction_shared.git"},
+		&Dep{ID: "plain", Path: "go.mod", Body: "package transaction_shared"},
+		&Dep{ID: "miss", Path: "go.mod", Body: "git.example.com/acme/services/other/thing.git"},
+	)
+	ctx := context.Background()
+
+	cases := []struct {
+		query string
+		want  map[string]bool
+		deny  map[string]bool
+	}{
+		{
+			query: "transaction_shared",
+			want:  map[string]bool{"hit": true, "plain": true},
+			deny:  map[string]bool{"miss": true},
+		},
+		{
+			query: "git.example.com/acme/services/transactions/transaction_shared.git",
+			want:  map[string]bool{"hit": true},
+			deny:  map[string]bool{"miss": true},
+		},
+	}
+
+	for _, tc := range cases {
+		res, _, err := b.Search(ctx, tc.query, 10, 0)
+		if err != nil {
+			t.Fatalf("search %q: %v", tc.query, err)
+		}
+		got := ids(res)
+		for id := range tc.want {
+			if !got[id] {
+				t.Errorf("query %q: expected to find %q, got %v", tc.query, id, got)
+			}
+		}
+		for id := range tc.deny {
+			if got[id] {
+				t.Errorf("query %q: did not expect %q, got %v", tc.query, id, got)
+			}
+		}
+	}
+}
+
 func TestSearch_OR(t *testing.T) {
 	b := newDepBucket(t,
 		&Dep{ID: "1", Body: "the go programming language"},
