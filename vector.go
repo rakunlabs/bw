@@ -1,6 +1,7 @@
 package bw
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -129,12 +130,6 @@ type vectorIndex struct {
 	// deterministic seed via WithVectorSeed.
 	rngMu sync.Mutex
 	rng   *vecRand
-
-	mu sync.Mutex
-	// dim caches the manifest dimension after the first read or
-	// successful write. Zero means "not yet locked in"; the next
-	// write will set it.
-	dim int
 }
 
 // vecRand is a tiny deterministic LCG so HNSW level selection is
@@ -228,10 +223,43 @@ func openVectorIndex(_ *DB, bucket string, fields []*schema.Field) (*vectorIndex
 		bucket:   bucket,
 		field:    f,
 		defaultM: parseMetricName(f.VectorMetric),
-		dim:      f.VectorDim,
 		rng:      newVecRand(0),
 	}
 	return vi, nil
+}
+
+func (vi *vectorIndex) configure(db *DB, M, efConstruction int) error {
+	if M == 1 {
+		return fmt.Errorf("bw: vector HNSW M must be at least 2")
+	}
+	var man vectorManifest
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		var err error
+		man, err = vi.readManifest(btx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if man.Dim != 0 {
+		storedM := int(man.M)
+		if storedM == 0 {
+			storedM = defaultHNSWM
+		}
+		storedEf := int(man.EfConstruction)
+		if storedEf == 0 {
+			storedEf = defaultHNSWEfConstruction
+		}
+		if M > 0 && M != storedM {
+			return fmt.Errorf("bw: vector HNSW M is already %d, got %d", storedM, M)
+		}
+		if efConstruction > 0 && efConstruction != storedEf {
+			return fmt.Errorf("bw: vector HNSW efConstruction is already %d, got %d", storedEf, efConstruction)
+		}
+	}
+	vi.wantM = M
+	vi.wantEfConstruction = efConstruction
+	return nil
 }
 
 // HNSW defaults. Conservative; bigger M trades insert latency for
@@ -303,36 +331,69 @@ func decodeManifest(b []byte) (vectorManifest, error) {
 		return m, fmt.Errorf("manifest dim varint")
 	}
 	m.Dim = v
+	if m.Dim > uint64(^uint(0)>>1) {
+		return m, fmt.Errorf("manifest dim %d overflows int", m.Dim)
+	}
 	rest = rest[n:]
 	v, n = binary.Uvarint(rest)
 	if n <= 0 {
 		return m, fmt.Errorf("manifest metric varint")
 	}
 	m.Metric = v
+	if m.Metric > uint64(Euclidean) {
+		return m, fmt.Errorf("manifest metric %d is invalid", m.Metric)
+	}
 	rest = rest[n:]
+	if len(rest) == 0 {
+		return m, nil
+	}
 	v, n = binary.Uvarint(rest)
 	if n <= 0 {
-		return m, nil
+		return m, fmt.Errorf("manifest count varint")
 	}
 	m.Count = v
+	if m.Count > uint64(^uint(0)>>1) {
+		return m, fmt.Errorf("manifest count %d overflows int", m.Count)
+	}
 	rest = rest[n:]
+	if len(rest) == 0 {
+		return m, nil
+	}
 	v, n = binary.Uvarint(rest)
 	if n <= 0 {
-		return m, nil
+		return m, fmt.Errorf("manifest M varint")
 	}
 	m.M = v
+	if m.M == 1 {
+		return m, fmt.Errorf("manifest M must be at least 2")
+	}
+	if m.M > uint64(^uint(0)>>1) {
+		return m, fmt.Errorf("manifest M %d overflows int", m.M)
+	}
 	rest = rest[n:]
+	if len(rest) == 0 {
+		return m, nil
+	}
 	v, n = binary.Uvarint(rest)
 	if n <= 0 {
-		return m, nil
+		return m, fmt.Errorf("manifest efConstruction varint")
 	}
 	m.EfConstruction = v
+	if m.EfConstruction > uint64(^uint(0)>>1) {
+		return m, fmt.Errorf("manifest efConstruction %d overflows int", m.EfConstruction)
+	}
 	rest = rest[n:]
-	v, n = binary.Uvarint(rest)
-	if n <= 0 {
+	if len(rest) == 0 {
 		return m, nil
 	}
+	v, n = binary.Uvarint(rest)
+	if n <= 0 {
+		return m, fmt.Errorf("manifest maxLevel varint")
+	}
 	m.MaxLevel = v
+	if m.MaxLevel > 31 {
+		return m, fmt.Errorf("manifest maxLevel %d exceeds 31", m.MaxLevel)
+	}
 	return m, nil
 }
 
@@ -381,6 +442,9 @@ func (vi *vectorIndex) readEntry(btx *badger.Txn) ([]byte, uint8, error) {
 			return fmt.Errorf("bw: vector entry value too short")
 		}
 		lvl = val[0]
+		if lvl > 31 {
+			return fmt.Errorf("bw: vector entry level %d exceeds 31", lvl)
+		}
 		rest := val[1:]
 		l, n := binary.Uvarint(rest)
 		if n <= 0 || uint64(len(rest)-n) < l {
@@ -415,6 +479,9 @@ func (vi *vectorIndex) readLevel(btx *badger.Txn, pk []byte) (uint8, error) {
 			return fmt.Errorf("bw: vector level value too short")
 		}
 		lvl = val[0]
+		if lvl > 31 {
+			return fmt.Errorf("bw: vector level %d exceeds 31", lvl)
+		}
 		return nil
 	})
 	return lvl, err
@@ -441,6 +508,11 @@ func (vi *vectorIndex) readNeighbours(btx *badger.Txn, pk []byte, level uint8) (
 			return fmt.Errorf("bw: vector neigh count varint")
 		}
 		rest := val[n:]
+		// Every encoded neighbour needs at least a one-byte length
+		// prefix, so a larger count cannot be represented by rest.
+		if count > uint64(len(rest)) {
+			return fmt.Errorf("bw: vector neigh count %d exceeds encoded value", count)
+		}
 		out = make([][]byte, 0, count)
 		for i := uint64(0); i < count; i++ {
 			l, m := binary.Uvarint(rest)
@@ -524,6 +596,9 @@ func decodeVector(b []byte) ([]float32, error) {
 	out := make([]float32, len(b)/4)
 	for i := range out {
 		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+		if math.IsNaN(float64(out[i])) || math.IsInf(float64(out[i]), 0) {
+			return nil, fmt.Errorf("bw: vector component %d is not finite", i)
+		}
 	}
 	return out, nil
 }
@@ -540,6 +615,9 @@ func decodeVector(b []byte) ([]float32, error) {
 func (vi *vectorIndex) writeVec(btx *badger.Txn, pk []byte, v []float32) error {
 	if len(v) == 0 {
 		return ErrVectorEmpty
+	}
+	if err := validateVector(v); err != nil {
+		return err
 	}
 
 	man, err := vi.readManifest(btx)
@@ -567,23 +645,28 @@ func (vi *vectorIndex) writeVec(btx *badger.Txn, pk []byte, v []float32) error {
 
 	rawKey := vecRawKey(vi.bucket, vi.field.Name, pk)
 
-	// Detect overwrite-of-live so we can decommission the old graph
-	// node before installing the new one. Tombstoned vectors carry
-	// no graph state; treat them as "not present".
-	hadOld := false
+	// Existing nodes, including tombstoned routing nodes, must be
+	// removed from the graph before the replacement is installed.
+	hadRaw := false
 	if _, gErr := btx.Get(rawKey); gErr == nil {
-		hadOld = true
+		hadRaw = true
 	} else if !errors.Is(gErr, badger.ErrKeyNotFound) {
 		return gErr
 	}
+	wasTombstoned, err := vi.isTombstoned(btx, pk)
+	if err != nil {
+		return err
+	}
 
-	if hadOld {
-		if err := vi.removeFromGraph(btx, pk, man); err != nil {
+	if hadRaw || wasTombstoned {
+		if err := vi.removeFromGraph(btx, pk, &man); err != nil {
 			return err
 		}
-		// removeFromGraph decremented Count; we increment again
-		// below as if this were a fresh insert.
-		man.Count--
+		// Tombstoned nodes have already been removed from the live
+		// count even though their raw vectors remain for graph routing.
+		if !wasTombstoned && man.Count > 0 {
+			man.Count--
+		}
 	}
 
 	// A reviving overwrite clears any stale tombstone.
@@ -605,33 +688,32 @@ func (vi *vectorIndex) writeVec(btx *badger.Txn, pk []byte, v []float32) error {
 	if err := vi.writeManifest(btx, man); err != nil {
 		return err
 	}
-	vi.mu.Lock()
-	vi.dim = int(man.Dim)
-	vi.mu.Unlock()
 	return nil
 }
 
-// deleteVec drops the live vector and tombstones the pk so the
-// remaining graph still resolves. Neighbour lists pointing at the
-// tombstoned node stay intact: the search path skips tombstoned hits,
-// so the graph topology degrades gracefully rather than tearing at
-// the moment of deletion. A future compaction step (Bucket.CompactVectors)
-// will trim those edges.
+// deleteVec tombstones the pk but retains its raw vector and graph
+// edges. HNSW still needs the vector to score and traverse through a
+// deleted routing node; search filters the node from returned hits.
 func (vi *vectorIndex) deleteVec(btx *badger.Txn, pk []byte) error {
 	rawKey := vecRawKey(vi.bucket, vi.field.Name, pk)
-	had := false
-	if _, err := btx.Get(rawKey); err == nil {
-		had = true
-	} else if !errors.Is(err, badger.ErrKeyNotFound) {
+	dead, err := vi.isTombstoned(btx, pk)
+	if err != nil {
 		return err
 	}
-	if !had {
+	if dead {
 		return nil
 	}
 
-	if err := btx.Delete(rawKey); err != nil {
+	hadRaw := false
+	if _, err := btx.Get(rawKey); err == nil {
+		hadRaw = true
+	} else if !errors.Is(err, badger.ErrKeyNotFound) {
 		return err
 	}
+	if !hadRaw {
+		return nil
+	}
+
 	if err := btx.Set(vecTombKey(vi.bucket, vi.field.Name, pk), []byte{1}); err != nil {
 		return err
 	}
@@ -649,19 +731,20 @@ func (vi *vectorIndex) deleteVec(btx *badger.Txn, pk []byte) error {
 // removeFromGraph drops every neighbour-list entry and the level key
 // for pk. It does not touch the entry-point key or count; callers
 // adjust those as part of the larger update.
-func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man vectorManifest) error {
+func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man *vectorManifest) error {
 	level, err := vi.readLevel(btx, pk)
 	if err != nil {
 		return err
 	}
-	for L := uint8(0); L <= level; L++ {
-		neighs, err := vi.readNeighbours(btx, pk, L)
+	for L := 0; L <= int(level); L++ {
+		graphLevel := uint8(L)
+		neighs, err := vi.readNeighbours(btx, pk, graphLevel)
 		if err != nil {
 			return err
 		}
 		// Drop the back-edge from each neighbour pointing at us.
 		for _, np := range neighs {
-			rev, err := vi.readNeighbours(btx, np, L)
+			rev, err := vi.readNeighbours(btx, np, graphLevel)
 			if err != nil {
 				return err
 			}
@@ -672,14 +755,14 @@ func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man vectorMan
 				}
 			}
 			if len(pruned) == 0 {
-				if err := vi.deleteNeighbours(btx, np, L); err != nil {
+				if err := vi.deleteNeighbours(btx, np, graphLevel); err != nil {
 					return err
 				}
-			} else if err := vi.writeNeighbours(btx, np, L, pruned); err != nil {
+			} else if err := vi.writeNeighbours(btx, np, graphLevel, pruned); err != nil {
 				return err
 			}
 		}
-		if err := vi.deleteNeighbours(btx, pk, L); err != nil {
+		if err := vi.deleteNeighbours(btx, pk, graphLevel); err != nil {
 			return err
 		}
 	}
@@ -697,7 +780,7 @@ func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man vectorMan
 		return err
 	}
 	if ep != nil && vecBytesEqual(ep, pk) {
-		survivor, surLevel, err := vi.findSurvivor(btx)
+		survivor, surLevel, err := vi.findSurvivor(btx, int(man.Dim))
 		if err != nil {
 			return err
 		}
@@ -721,7 +804,7 @@ func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man vectorMan
 
 // findSurvivor returns any (pk, level) with a level marker set. Used
 // when the entry point is being deleted and we need a fallback.
-func (vi *vectorIndex) findSurvivor(btx *badger.Txn) ([]byte, uint8, error) {
+func (vi *vectorIndex) findSurvivor(btx *badger.Txn, expectedDim int) ([]byte, uint8, error) {
 	pfx := append([]byte{}, vecFieldPrefix(vi.bucket, vi.field.Name)...)
 	pfx = append(pfx, vecLevelMark...)
 	opts := badger.DefaultIteratorOptions
@@ -744,13 +827,26 @@ func (vi *vectorIndex) findSurvivor(btx *badger.Txn) ([]byte, uint8, error) {
 		var lvl uint8
 		err = item.Value(func(val []byte) error {
 			if len(val) < 1 {
-				return fmt.Errorf("level value too short")
+				return fmt.Errorf("bw: vector level value too short")
 			}
 			lvl = val[0]
+			if lvl > 31 {
+				return fmt.Errorf("bw: vector level %d exceeds 31", lvl)
+			}
 			return nil
 		})
 		if err != nil {
 			return nil, 0, err
+		}
+		v, err := vi.readVec(btx, pk)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		if expectedDim > 0 && len(v) != expectedDim {
+			continue
 		}
 		return pk, lvl, nil
 	}
@@ -788,6 +884,22 @@ func score(metric VectorMetric, a, b []float32) float64 {
 	default: // Cosine, MetricDefault treated as Cosine here
 		return cosine(a, b)
 	}
+}
+
+func scoreChecked(metric VectorMetric, a, b []float32) (float64, error) {
+	if len(a) != len(b) {
+		return 0, fmt.Errorf("%w: score dimensions %d and %d", ErrDimMismatch, len(a), len(b))
+	}
+	return score(metric, a, b), nil
+}
+
+func validateVector(v []float32) error {
+	for i, value := range v {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return fmt.Errorf("bw: vector component %d is not finite", i)
+		}
+	}
+	return nil
 }
 
 func dot(a, b []float32) float64 {
@@ -861,7 +973,10 @@ func (vi *vectorIndex) greedySearchLevel(btx *badger.Txn, entry []byte, q []floa
 	if err != nil {
 		return nil, 0, err
 	}
-	currScore := score(metric, q, currVec)
+	currScore, err := scoreChecked(metric, q, currVec)
+	if err != nil {
+		return nil, 0, err
+	}
 	for {
 		neighs, err := vi.readNeighbours(btx, curr, level)
 		if err != nil {
@@ -877,7 +992,10 @@ func (vi *vectorIndex) greedySearchLevel(btx *badger.Txn, entry []byte, q []floa
 				}
 				return nil, 0, err
 			}
-			s := score(metric, q, nv)
+			s, err := scoreChecked(metric, q, nv)
+			if err != nil {
+				return nil, 0, err
+			}
 			if s > currScore {
 				curr = np
 				currScore = s
@@ -961,7 +1079,10 @@ func (vi *vectorIndex) efSearchLevel(
 				}
 				return nil, err
 			}
-			s := score(metric, q, nv)
+			s, err := scoreChecked(metric, q, nv)
+			if err != nil {
+				return nil, err
+			}
 			cd := candDist{pk: np, score: s}
 
 			// Always feed the frontier — the graph isn't
@@ -1026,11 +1147,14 @@ func (vi *vectorIndex) selectNeighborsHeuristic(
 			return nil, err
 		}
 		good := true
-		for i, sv := range selectedVecs {
+		for _, sv := range selectedVecs {
 			// "candidate is closer to a selected neighbour
 			// than to the new node" → reject.
-			if score(metric, cv, sv) > c.score {
-				_ = i
+			s, err := scoreChecked(metric, cv, sv)
+			if err != nil {
+				return nil, err
+			}
+			if s > c.score {
 				good = false
 				break
 			}
@@ -1070,6 +1194,9 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 	if metric == MetricDefault {
 		metric = vi.defaultM
 	}
+	if metric < Cosine || metric > Euclidean {
+		return man, fmt.Errorf("bw: invalid vector metric %d", metric)
+	}
 
 	level := vi.randomLevel(M)
 	if err := vi.writeLevel(btx, pk, level); err != nil {
@@ -1088,10 +1215,43 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 		man.MaxLevel = uint64(level)
 		return man, nil
 	}
+	if man.Count == 0 {
+		if err := vi.writeEntry(btx, pk, level); err != nil {
+			return man, err
+		}
+		man.MaxLevel = uint64(level)
+		return man, nil
+	}
 
+	// v0.3.0 deleted raw vectors while leaving their graph nodes in
+	// place. Repair a stale entry point so existing databases can keep
+	// accepting inserts after upgrading.
+	epVec, err := vi.readVec(btx, ep)
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		survivor, survivorLevel, findErr := vi.findSurvivor(btx, len(v))
+		if findErr != nil {
+			return man, findErr
+		}
+		if survivor == nil {
+			return man, fmt.Errorf("bw: vector graph has no readable live entry point")
+		}
+		ep = survivor
+		epLevel = survivorLevel
+		if err := vi.writeEntry(btx, ep, epLevel); err != nil {
+			return man, err
+		}
+		man.MaxLevel = uint64(epLevel)
+		epVec, err = vi.readVec(btx, ep)
+	}
+	if err != nil {
+		return man, fmt.Errorf("bw: read vector graph entry: %w", err)
+	}
 	// Greedy descent on every level above the new node's max level.
 	curr := ep
-	currScore := score(metric, v, mustReadVec(btx, vi, ep))
+	currScore, err := scoreChecked(metric, v, epVec)
+	if err != nil {
+		return man, err
+	}
 	for L := int(epLevel); L > int(level); L-- {
 		next, ns, err := vi.greedySearchLevel(btx, curr, v, metric, uint8(L))
 		if err != nil {
@@ -1140,7 +1300,16 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 			if err != nil {
 				return man, err
 			}
-			rev = append(rev, append([]byte(nil), pk...))
+			alreadyLinked := false
+			for _, rp := range rev {
+				if vecBytesEqual(rp, pk) {
+					alreadyLinked = true
+					break
+				}
+			}
+			if !alreadyLinked {
+				rev = append(rev, append([]byte(nil), pk...))
+			}
 			if len(rev) > M {
 				// Re-rank rev under the neighbour's metric
 				// view: distances to *the neighbour*, then
@@ -1158,10 +1327,11 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 						}
 						return man, err
 					}
-					ranked = append(ranked, candDist{
-						pk:    rp,
-						score: score(metric, nv, rv),
-					})
+					s, err := scoreChecked(metric, nv, rv)
+					if err != nil {
+						return man, err
+					}
+					ranked = append(ranked, candDist{pk: rp, score: s})
 				}
 				sort.Slice(ranked, func(i, j int) bool {
 					return ranked[i].score > ranked[j].score
@@ -1169,6 +1339,32 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 				kept, err := vi.selectNeighborsHeuristic(btx, ranked, M, metric)
 				if err != nil {
 					return man, err
+				}
+				keptSet := make(map[string]struct{}, len(kept))
+				for _, k := range kept {
+					keptSet[string(k.pk)] = struct{}{}
+				}
+				for _, rp := range rev {
+					if _, ok := keptSet[string(rp)]; ok {
+						continue
+					}
+					reciprocal, err := vi.readNeighbours(btx, rp, uint8(L))
+					if err != nil {
+						return man, err
+					}
+					filtered := reciprocal[:0]
+					for _, edge := range reciprocal {
+						if !vecBytesEqual(edge, n.pk) {
+							filtered = append(filtered, edge)
+						}
+					}
+					if len(filtered) == 0 {
+						if err := vi.deleteNeighbours(btx, rp, uint8(L)); err != nil {
+							return man, err
+						}
+					} else if err := vi.writeNeighbours(btx, rp, uint8(L), filtered); err != nil {
+						return man, err
+					}
 				}
 				rev = rev[:0]
 				for _, k := range kept {
@@ -1198,21 +1394,6 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 		}
 	}
 	return man, nil
-}
-
-// mustReadVec is a tiny helper for the tight greedy descent at insert
-// time. It panics on error rather than threading errors through the
-// loop because the caller already verified the entry-point exists in
-// the same txn; a missing vector here is a real corruption.
-func mustReadVec(btx *badger.Txn, vi *vectorIndex, pk []byte) []float32 {
-	v, err := vi.readVec(btx, pk)
-	if err != nil {
-		// Treat as zero-vector so descent terminates rather than
-		// panics; this can only happen on data corruption and
-		// the caller will see scores of 0.
-		return make([]float32, vi.dim)
-	}
-	return v
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1518,7 @@ func (h *scoreHeap) drainSorted(desc bool) []candDist {
 // fall back to brute force, which is both faster and trivially exact
 // at small N. For the rest, the HNSW algorithm runs.
 func (vi *vectorIndex) search(
-	db *DB,
+	btx *badger.Txn,
 	q []float32,
 	k int,
 	efSearch int,
@@ -1348,8 +1529,14 @@ func (vi *vectorIndex) search(
 	if len(q) == 0 {
 		return ErrVectorEmpty
 	}
+	if err := validateVector(q); err != nil {
+		return err
+	}
 	if metric == MetricDefault {
 		metric = vi.defaultM
+	}
+	if metric < Cosine || metric > Euclidean {
+		return fmt.Errorf("bw: invalid vector metric %d", metric)
 	}
 	if k <= 0 {
 		k = 10
@@ -1367,16 +1554,20 @@ func (vi *vectorIndex) search(
 	}
 	var hits []rankedHit
 
-	err := db.bdb.View(func(btx *badger.Txn) error {
+	err := func() error {
 		man, err := vi.readManifest(btx)
 		if err != nil {
 			return err
 		}
+		dim := int(man.Dim)
+		if dim == 0 {
+			dim = vi.field.VectorDim
+		}
+		if dim > 0 && dim != len(q) {
+			return fmt.Errorf("%w: bucket dim=%d, query dim=%d", ErrDimMismatch, dim, len(q))
+		}
 		if man.Count == 0 {
 			return nil
-		}
-		if int(man.Dim) != len(q) {
-			return fmt.Errorf("%w: bucket dim=%d, query dim=%d", ErrDimMismatch, man.Dim, len(q))
 		}
 
 		// Brute-force fallback: graphs below this size, or
@@ -1384,7 +1575,12 @@ func (vi *vectorIndex) search(
 		// trivially exact) without HNSW.
 		const bruteThreshold = 64
 		filterIsTight := allowed != nil && len(allowed) <= bruteThreshold
-		if int(man.Count) <= bruteThreshold || filterIsTight {
+		graphMetric := VectorMetric(man.Metric)
+		if graphMetric == MetricDefault {
+			graphMetric = vi.defaultM
+		}
+		metricOverride := metric != graphMetric
+		if int(man.Count) <= bruteThreshold || filterIsTight || metricOverride {
 			h, err := vi.bruteSearch(btx, q, k, metric, allowed)
 			if err != nil {
 				return err
@@ -1407,10 +1603,23 @@ func (vi *vectorIndex) search(
 		}
 		curr := ep
 		currVec, err := vi.readVec(btx, curr)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			h, bruteErr := vi.bruteSearch(btx, q, k, metric, allowed)
+			if bruteErr != nil {
+				return bruteErr
+			}
+			for _, result := range h {
+				hits = append(hits, rankedHit{pk: result.pk, score: result.score})
+			}
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		currScore := score(metric, q, currVec)
+		currScore, err := scoreChecked(metric, q, currVec)
+		if err != nil {
+			return err
+		}
 		for L := int(epLevel); L >= 1; L-- {
 			next, ns, err := vi.greedySearchLevel(btx, curr, q, metric, uint8(L))
 			if err != nil {
@@ -1432,7 +1641,7 @@ func (vi *vectorIndex) search(
 			hits = append(hits, rankedHit{pk: r.pk, score: r.score})
 		}
 		return nil
-	})
+	}()
 	if err != nil {
 		return err
 	}
@@ -1498,7 +1707,10 @@ func (vi *vectorIndex) bruteSearch(
 		if err != nil {
 			return nil, err
 		}
-		s := score(metric, q, v)
+		s, err := scoreChecked(metric, q, v)
+		if err != nil {
+			return nil, err
+		}
 		heap.push(minHeapItem{pk: pk, score: s})
 	}
 	hits := heap.drain()
@@ -1509,6 +1721,219 @@ func (vi *vectorIndex) bruteSearch(
 		return string(hits[i].pk) < string(hits[j].pk)
 	})
 	return hits, nil
+}
+
+// compact rebuilds the vector namespace from live raw vectors. The caller
+// must exclude ordinary transactions for the full operation.
+func (vi *vectorIndex) compact(ctx context.Context, db *DB) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	type storedVector struct {
+		pk []byte
+		v  []float32
+	}
+	var (
+		man     vectorManifest
+		vectors []storedVector
+	)
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		var err error
+		man, err = vi.readManifest(btx)
+		if err != nil {
+			return err
+		}
+		prefix := vecRawPrefix(vi.bucket, vi.field.Name)
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := btx.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			pk := append([]byte(nil), pkFromVecRawKey(it.Item().KeyCopy(nil), prefix)...)
+			dead, err := vi.isTombstoned(btx, pk)
+			if err != nil {
+				return err
+			}
+			if dead {
+				continue
+			}
+			if _, err := btx.Get(dataKey(vi.bucket, pk)); errors.Is(err, badger.ErrKeyNotFound) {
+				continue
+			} else if err != nil {
+				return err
+			}
+			var v []float32
+			if err := it.Item().Value(func(raw []byte) error {
+				var err error
+				v, err = decodeVector(raw)
+				return err
+			}); err != nil {
+				return err
+			}
+			if man.Dim > 0 && len(v) != int(man.Dim) {
+				return fmt.Errorf("%w: bucket dim=%d, stored dim=%d", ErrDimMismatch, man.Dim, len(v))
+			}
+			vectors = append(vectors, storedVector{pk: pk, v: v})
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	live := make(map[string]struct{}, len(vectors))
+	for _, stored := range vectors {
+		live[string(stored.pk)] = struct{}{}
+	}
+	if err := db.bdb.Update(func(btx *badger.Txn) error {
+		return btx.Set(vecMaintenanceKey(vi.bucket, vi.field.Name), []byte{1})
+	}); err != nil {
+		return err
+	}
+	if err := vi.clearGraphForRebuild(db, live); err != nil {
+		return err
+	}
+	man.Count = 0
+	man.MaxLevel = 0
+	if man.Dim == 0 && vi.field.VectorDim > 0 {
+		man.Dim = uint64(vi.field.VectorDim)
+	}
+	if man.Metric == 0 {
+		man.Metric = uint64(vi.defaultM)
+	}
+	if err := db.bdb.Update(func(btx *badger.Txn) error {
+		return vi.writeManifest(btx, man)
+	}); err != nil {
+		return err
+	}
+	for _, stored := range vectors {
+		if err := db.bdb.Update(func(btx *badger.Txn) error {
+			if err := btx.Delete(vecRawKey(vi.bucket, vi.field.Name, stored.pk)); err != nil {
+				return err
+			}
+			return vi.writeVec(btx, stored.pk, stored.v)
+		}); err != nil {
+			return err
+		}
+	}
+	return db.bdb.Update(func(btx *badger.Txn) error {
+		return btx.Delete(vecMaintenanceKey(vi.bucket, vi.field.Name))
+	})
+}
+
+func (vi *vectorIndex) clearGraphForRebuild(db *DB, live map[string]struct{}) error {
+	prefix := vecFieldPrefix(vi.bucket, vi.field.Name)
+	rawPrefix := vecRawPrefix(vi.bucket, vi.field.Name)
+	manifestKey := vecManifestKey(vi.bucket, vi.field.Name)
+	maintenanceKey := vecMaintenanceKey(vi.bucket, vi.field.Name)
+	const batchSize = 1024
+	for {
+		var keys [][]byte
+		err := db.bdb.View(func(btx *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			opts.Prefix = prefix
+			opts.PrefetchValues = false
+			it := btx.NewIterator(opts)
+			defer it.Close()
+			for it.Seek(prefix); it.ValidForPrefix(prefix) && len(keys) < batchSize; it.Next() {
+				key := it.Item().KeyCopy(nil)
+				if vecBytesEqual(key, manifestKey) || vecBytesEqual(key, maintenanceKey) {
+					continue
+				}
+				if len(key) >= len(rawPrefix) && vecBytesEqual(key[:len(rawPrefix)], rawPrefix) {
+					pk := pkFromVecRawKey(key, rawPrefix)
+					if _, ok := live[string(pk)]; ok {
+						continue
+					}
+				}
+				keys = append(keys, key)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if len(keys) == 0 {
+			return nil
+		}
+		if err := db.bdb.Update(func(btx *badger.Txn) error {
+			for _, key := range keys {
+				if err := btx.Delete(key); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+func (vi *vectorIndex) maintenancePending(db *DB) (bool, error) {
+	var pending bool
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		_, err := btx.Get(vecMaintenanceKey(vi.bucket, vi.field.Name))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		pending = true
+		return nil
+	})
+	return pending, err
+}
+
+func vectorFieldsOnDisk(db *DB, bucket string) ([]string, error) {
+	prefix := vecBucketPrefix(bucket)
+	fields := make(map[string]struct{})
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		opts.PrefetchValues = false
+		it := btx.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			rest := it.Item().Key()[len(prefix):]
+			for i, c := range rest {
+				if c == sep {
+					if i > 0 {
+						fields[string(rest[:i])] = struct{}{}
+					}
+					break
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(fields))
+	for field := range fields {
+		out = append(out, field)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func readVectorManifestForField(db *DB, bucket, field string) (vectorManifest, error) {
+	var man vectorManifest
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		item, err := btx.Get(vecManifestKey(bucket, field))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(raw []byte) error {
+			var err error
+			man, err = decodeManifest(raw)
+			return err
+		})
+	})
+	return man, err
 }
 
 // ---------------------------------------------------------------------------

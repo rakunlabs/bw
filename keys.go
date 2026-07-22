@@ -325,6 +325,11 @@ func vecManifestKey(bucket, field string) []byte {
 	return out
 }
 
+func vecMaintenanceKey(bucket, field string) []byte {
+	pfx := vecFieldPrefix(bucket, field)
+	return append(pfx, 'c', sep)
+}
+
 // vecTombKey returns the soft-delete tombstone key for (bucket, field, pk).
 func vecTombKey(bucket, field string, pk []byte) []byte {
 	pfx := vecFieldPrefix(bucket, field)
@@ -411,6 +416,15 @@ func migProgressKey(bucket string, fromV, toV uint64) []byte {
 	out = append(out, buf[:n]...)
 	out = append(out, sep)
 	out = append(out, "progress"...)
+	return out
+}
+
+func vectorReconcileKey(bucket string) []byte {
+	out := make([]byte, 0, len(migPrefix)+len(bucket)+len("\x00vector-reconcile"))
+	out = append(out, migPrefix...)
+	out = append(out, bucket...)
+	out = append(out, sep)
+	out = append(out, "vector-reconcile"...)
 	return out
 }
 

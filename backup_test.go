@@ -3,6 +3,7 @@ package bw_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/rakunlabs/bw"
@@ -71,6 +72,46 @@ func TestBackupAndRestore(t *testing.T) {
 		if got.Name != want.Name || got.Email != want.Email || got.Age != want.Age {
 			t.Fatalf("mismatch for %s: got %+v, want %+v", want.ID, got, want)
 		}
+	}
+}
+
+func TestRestoreReplacesContentsAndKeepsActiveHandle(t *testing.T) {
+	ctx := context.Background()
+	source, err := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceUsers := newUsers(t, source)
+	if err := sourceUsers.Insert(ctx, &User{ID: "source", Name: "source", Email: "source@x"}); err != nil {
+		t.Fatal(err)
+	}
+	var backup bytes.Buffer
+	if _, err := source.Backup(&backup, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	_ = source.Close()
+
+	destination, err := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	destinationUsers := newUsers(t, destination)
+	if err := destinationUsers.Insert(ctx, &User{ID: "destination", Name: "destination", Email: "destination@x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.Restore(&backup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := destinationUsers.Get(ctx, "destination"); !errors.Is(err, bw.ErrStaleBucket) {
+		t.Fatalf("active handle was not invalidated by Restore: %v", err)
+	}
+	destinationUsers = newUsers(t, destination)
+	if _, err := destinationUsers.Get(ctx, "destination"); !errors.Is(err, bw.ErrNotFound) {
+		t.Fatalf("destination-only record survived Restore: %v", err)
+	}
+	if _, err := destinationUsers.Get(ctx, "source"); err != nil {
+		t.Fatalf("re-registered handle cannot read restored source record: %v", err)
 	}
 }
 
@@ -263,7 +304,7 @@ func TestIncrementalBackup(t *testing.T) {
 	if err := db2.Restore(&fullBuf); err != nil {
 		t.Fatalf("restore full: %v", err)
 	}
-	if err := db2.Restore(&incrBuf); err != nil {
+	if err := db2.ApplyBackup(&incrBuf); err != nil {
 		t.Fatalf("restore incremental: %v", err)
 	}
 

@@ -50,9 +50,10 @@ type RawMigrationFn func(ctx context.Context, raw []byte) ([]byte, error)
 
 // userMigration is one registered migration step.
 type userMigration struct {
-	fromV uint64
-	toV   uint64
-	apply RawMigrationFn
+	fromV         uint64
+	toV           uint64
+	apply         RawMigrationFn
+	vectorReembed bool
 }
 
 // WithRawMigration registers a byte-level migration step from
@@ -105,9 +106,10 @@ func WithTypedMigration[Old, New any](fromV, toV uint64, fn func(ctx context.Con
 			return out, nil
 		}
 		b.userMigrations = append(b.userMigrations, userMigration{
-			fromV: fromV,
-			toV:   toV,
-			apply: raw,
+			fromV:         fromV,
+			toV:           toV,
+			apply:         raw,
+			vectorReembed: true,
 		})
 	}
 }
@@ -249,6 +251,21 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 	if err != nil {
 		return err
 	}
+	if len(resumePK) == 0 {
+		needsRebuild, err := b.vectorStorageNeedsRebuild()
+		if err != nil {
+			return err
+		}
+		if b.vecIdx != nil && (step.vectorReembed || needsRebuild) {
+			if err := b.resetVectorStorageForReembed(); err != nil {
+				return fmt.Errorf("bw: reset vector index for migration: %w", err)
+			}
+		}
+	}
+	batchSize := migrationBatchSize
+	if b.vecIdx != nil {
+		batchSize = 1
+	}
 
 	total, err := b.countData()
 	if err != nil {
@@ -267,7 +284,7 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 		default:
 		}
 
-		batch, lastPK, err := b.collectMigrationBatch(prefix, resumePK)
+		batch, lastPK, err := b.collectMigrationBatch(prefix, resumePK, batchSize)
 		if err != nil {
 			return err
 		}
@@ -294,7 +311,7 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 			b.migrationProgress(b.name, step.fromV, step.toV, processed, total)
 		}
 
-		if len(batch) < migrationBatchSize {
+		if len(batch) < batchSize {
 			break
 		}
 	}
@@ -343,7 +360,7 @@ type migrationRecord struct {
 // pk is strictly greater than resumePK (or the first batch when
 // resumePK is empty). Returns the loaded records plus the pk of the
 // last entry, used as the next iteration's seek anchor.
-func (b *Bucket[T]) collectMigrationBatch(prefix, resumePK []byte) ([]migrationRecord, []byte, error) {
+func (b *Bucket[T]) collectMigrationBatch(prefix, resumePK []byte, batchSize int) ([]migrationRecord, []byte, error) {
 	var (
 		out    []migrationRecord
 		lastPK []byte
@@ -367,7 +384,7 @@ func (b *Bucket[T]) collectMigrationBatch(prefix, resumePK []byte) ([]migrationR
 			it.Next()
 		}
 
-		for ; it.ValidForPrefix(prefix) && len(out) < migrationBatchSize; it.Next() {
+		for ; it.ValidForPrefix(prefix) && len(out) < batchSize; it.Next() {
 			item := it.Item()
 			k := item.Key()
 			pk := append([]byte(nil), k[len(prefix):]...)

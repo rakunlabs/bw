@@ -18,6 +18,11 @@ type VecDoc struct {
 	Embed []float32 `bw:"embed,vector(dim=4,metric=cosine)"`
 }
 
+type VecDocNoDim struct {
+	ID    string    `bw:"id,pk"`
+	Embed []float32 `bw:"embed,vector(metric=cosine)"`
+}
+
 // L2-normalise so cosine and dot product produce identical scores.
 func unit(v []float32) []float32 {
 	var n float64
@@ -198,6 +203,101 @@ func TestVector_Delete(t *testing.T) {
 	}
 }
 
+// A deleted entry point must not leave a stale graph reference that
+// crashes the next insert when the dimension was inferred at runtime.
+func TestVector_DeleteLastThenInsertWithoutDeclaredDim(t *testing.T) {
+	ctx := context.Background()
+	db, err := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	bucket, err := bw.RegisterBucket[VecDocNoDim](db, "vec_delete_entry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Insert(ctx, &VecDocNoDim{ID: "a", Embed: []float32{1, 0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Insert(ctx, &VecDocNoDim{ID: "b", Embed: []float32{0, 1, 0}}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := bucket.SearchVector(ctx, []float32{0, 1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Record.ID != "b" {
+		t.Fatalf("want only b after replacing deleted entry, got %+v", hits)
+	}
+}
+
+func TestVector_UpdateToEmptyRemovesOldVector(t *testing.T) {
+	ctx := context.Background()
+	db, err := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	bucket, err := bw.RegisterBucket[VecDoc](db, "vec_empty_update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Insert(ctx, &VecDoc{ID: "a", Embed: []float32{1, 0, 0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Update(ctx, &VecDoc{ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := bucket.SearchVector(ctx, []float32{1, 0, 0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("empty update left the old vector searchable: %+v", hits)
+	}
+
+	if err := bucket.Update(ctx, &VecDoc{ID: "a", Embed: []float32{0, 1, 0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = bucket.SearchVector(ctx, []float32{0, 1, 0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Record.ID != "a" {
+		t.Fatalf("revived vector is not searchable: %+v", hits)
+	}
+}
+
+func TestVector_ValidatesEmptyBucketDimensionAndFiniteValues(t *testing.T) {
+	ctx := context.Background()
+	db, err := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	bucket, err := bw.RegisterBucket[VecDoc](db, "vec_validation")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := bucket.SearchVector(ctx, []float32{1, 0, 0}); !errors.Is(err, bw.ErrDimMismatch) {
+		t.Fatalf("empty bucket: want ErrDimMismatch, got %v", err)
+	}
+	if err := bucket.Insert(ctx, &VecDoc{ID: "nan", Embed: []float32{float32(math.NaN()), 0, 0, 0}}); err == nil {
+		t.Fatal("insert accepted NaN vector")
+	}
+	if _, err := bucket.SearchVector(ctx, []float32{float32(math.Inf(1)), 0, 0, 0}); err == nil {
+		t.Fatal("search accepted infinite vector")
+	}
+}
+
 // TestVector_RollbackLeavesNoTrace verifies the atomicity guarantee:
 // a transaction that inserts a vector but ultimately fails leaves no
 // vector keys behind.
@@ -321,12 +421,16 @@ func TestVector_Filter(t *testing.T) {
 
 // TestVector_Embedder validates auto-embedding on Insert.
 func TestVector_Embedder(t *testing.T) {
-	ctx := context.Background()
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "expected")
 	db, _ := bw.Open("", bw.WithInMemory(true), bw.WithLogger(nil))
 	defer db.Close()
 
 	// Embedder maps Title length → fake 4-D vector.
-	embed := func(_ context.Context, r *VecDoc) ([]float32, error) {
+	embed := func(ctx context.Context, r *VecDoc) ([]float32, error) {
+		if ctx.Value(contextKey{}) != "expected" {
+			return nil, errors.New("embedder context value missing")
+		}
 		x := float32(len(r.Title))
 		return unit([]float32{x, 0, 0, 0}), nil
 	}
@@ -336,8 +440,19 @@ func TestVector_Embedder(t *testing.T) {
 	}
 
 	// Insert without setting Embed — embedder fills it in.
-	if err := bucket.Insert(ctx, &VecDoc{ID: "a", Title: "abcd"}); err != nil {
+	record := &VecDoc{ID: "a", Title: "abcd"}
+	if err := bucket.Insert(ctx, record); err != nil {
 		t.Fatal(err)
+	}
+	if len(record.Embed) != 4 {
+		t.Fatalf("generated embedding was not assigned to input record: %+v", record)
+	}
+	stored, err := bucket.Get(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Embed) != 4 {
+		t.Fatalf("generated embedding was not persisted: %+v", stored)
 	}
 	hits, err := bucket.SearchVector(ctx, unit([]float32{1, 0, 0, 0}))
 	if err != nil {

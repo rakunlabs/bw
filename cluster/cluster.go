@@ -925,7 +925,7 @@ func (c *Cluster) handleStream(ctx context.Context, msg alan.Message, body io.Re
 	}
 
 	before := db.Version()
-	if err := db.Restore(body); err != nil {
+	if err := db.ApplyBackup(body); err != nil {
 		slog.Error("cluster: restore from stream failed",
 			"from", msg.Addr, "db", name, "error", err)
 		return err

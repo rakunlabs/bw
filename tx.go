@@ -14,11 +14,15 @@ type Tx struct {
 	btx  *badger.Txn
 	rw   bool
 	done bool
+
+	release func()
 }
 
 // View runs fn inside a read-only transaction. The transaction is
 // automatically discarded after fn returns.
 func (db *DB) View(fn func(tx *Tx) error) error {
+	db.accessMu.RLock()
+	defer db.accessMu.RUnlock()
 	return db.bdb.View(func(btx *badger.Txn) error {
 		tx := &Tx{db: db, btx: btx, rw: false}
 		return fn(tx)
@@ -26,8 +30,14 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 }
 
 // Update runs fn inside a read-write transaction. If fn returns nil,
-// the transaction is committed; otherwise it is discarded.
+// the transaction is committed; otherwise it is discarded. Callbacks must
+// use the Tx variants of bucket operations; starting another standalone
+// write from the callback would attempt to nest the single-writer gate.
 func (db *DB) Update(fn func(tx *Tx) error) error {
+	db.accessMu.RLock()
+	defer db.accessMu.RUnlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
 	return db.bdb.Update(func(btx *badger.Txn) error {
 		tx := &Tx{db: db, btx: btx, rw: true}
 		return fn(tx)
@@ -37,12 +47,18 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 // Begin starts a read-write transaction. The caller is responsible for
 // calling Commit or Discard.
 func (db *DB) Begin() *Tx {
-	return &Tx{db: db, btx: db.bdb.NewTransaction(true), rw: true}
+	db.accessMu.RLock()
+	db.writeMu.Lock()
+	return &Tx{db: db, btx: db.bdb.NewTransaction(true), rw: true, release: func() {
+		db.writeMu.Unlock()
+		db.accessMu.RUnlock()
+	}}
 }
 
 // BeginRead starts a read-only transaction.
 func (db *DB) BeginRead() *Tx {
-	return &Tx{db: db, btx: db.bdb.NewTransaction(false), rw: false}
+	db.accessMu.RLock()
+	return &Tx{db: db, btx: db.bdb.NewTransaction(false), rw: false, release: db.accessMu.RUnlock}
 }
 
 // Commit commits the transaction. Calling Commit on a read-only
@@ -52,6 +68,10 @@ func (tx *Tx) Commit() error {
 		return nil
 	}
 	tx.done = true
+	if tx.release != nil {
+		defer tx.release()
+		tx.release = nil
+	}
 
 	if !tx.rw {
 		tx.btx.Discard()
@@ -67,6 +87,10 @@ func (tx *Tx) Discard() {
 	}
 	tx.done = true
 	tx.btx.Discard()
+	if tx.release != nil {
+		tx.release()
+		tx.release = nil
+	}
 }
 
 // Badger returns the underlying *badger.Txn for advanced use.

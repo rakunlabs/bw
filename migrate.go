@@ -1,6 +1,7 @@
 package bw
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,8 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 	if err := validateBucketName(name); err != nil {
 		return nil, err
 	}
+	db.schemaMu.Lock()
+	defer db.schemaMu.Unlock()
 
 	var zero T
 	s, err := schema.Of(reflect.TypeOf(zero))
@@ -45,11 +48,26 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 		codec:  db.codec,
 		name:   name,
 		schema: s,
+		epoch:  db.trackBucket(name),
 	}
 	for _, o := range opts {
 		o(b)
 	}
-
+	storedFingerprint, err := db.readSchemaFingerprint(name)
+	if err != nil {
+		return nil, err
+	}
+	if storedFingerprint != "" && storedFingerprint != s.Fingerprint() {
+		b.epoch = db.invalidateBucket(name)
+	} else if b.version > 0 && len(b.userMigrations) > 0 {
+		storedVersion, err := b.readStoredVersion()
+		if err != nil {
+			return nil, err
+		}
+		if storedVersion < b.version {
+			b.epoch = db.invalidateBucket(name)
+		}
+	}
 	if b.keyFn == nil {
 		if s.PK == nil {
 			return nil, fmt.Errorf("bw: type %s has no `pk` tag and no WithKeyFn provided", s.Type.Name())
@@ -88,6 +106,44 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 		}
 	}
 
+	// Open (or reuse) the FTS handle so callers that switched
+	// RegisterBucket -> MigrateBucket on a schema change still get
+	// a working Search.
+	ftsFields := s.FTSFields()
+	if len(ftsFields) > 0 {
+		fi, ferr := openFTSIndex(db, name, ftsFields)
+		if ferr != nil {
+			return nil, ferr
+		}
+		b.ftsIdx = fi
+		db.fts.set(name, fi)
+	}
+
+	// Same for vector field, if any.
+	vecFields := s.VectorFields()
+	if len(vecFields) > 0 {
+		vi, verr := openVectorIndex(db, name, vecFields)
+		if verr != nil {
+			return nil, verr
+		}
+		if err := vi.configure(db, b.vectorM, b.vectorEfConstruction); err != nil {
+			return nil, err
+		}
+		b.vecIdx = vi
+		db.vec.set(name, vi)
+	}
+
+	storedV, err := b.readStoredVersion()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := b.runUserMigrations(context.Background(), storedV); err != nil {
+		return nil, err
+	}
+	if err := b.reconcileVectorStorage(context.Background()); err != nil {
+		return nil, fmt.Errorf("bw: reconcile vector schema: %w", err)
+	}
+
 	// Skip the incremental rebuild when the stored fingerprint already
 	// matches: rewriting identical metadata would still bump Badger's
 	// MaxVersion on every call.
@@ -98,38 +154,6 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 	if !skip {
 		if err := db.migrateBucketIncremental(name, s, b.version, b); err != nil {
 			return nil, err
-		}
-	}
-
-	// Open (or reuse) the FTS handle so callers that switched
-	// RegisterBucket -> MigrateBucket on a schema change still get
-	// a working Search.
-	ftsFields := s.FTSFields()
-	if len(ftsFields) > 0 {
-		if existing := db.fts.get(name); existing != nil {
-			b.ftsIdx = existing
-		} else {
-			fi, ferr := openFTSIndex(db, name, ftsFields)
-			if ferr != nil {
-				return nil, ferr
-			}
-			b.ftsIdx = fi
-			db.fts.set(name, fi)
-		}
-	}
-
-	// Same for vector field, if any.
-	vecFields := s.VectorFields()
-	if len(vecFields) > 0 {
-		if existing := db.vec.get(name); existing != nil {
-			b.vecIdx = existing
-		} else {
-			vi, verr := openVectorIndex(db, name, vecFields)
-			if verr != nil {
-				return nil, verr
-			}
-			b.vecIdx = vi
-			db.vec.set(name, vi)
 		}
 	}
 
@@ -185,6 +209,9 @@ type fieldManifestEntry struct {
 	Name    string `json:"n"`
 	Indexed bool   `json:"i,omitempty"`
 	Unique  bool   `json:"u,omitempty"`
+	Vector  bool   `json:"v,omitempty"`
+	Dim     int    `json:"d,omitempty"`
+	Metric  string `json:"m,omitempty"`
 }
 
 // manifestKey stores the field manifest alongside the fingerprint.
@@ -204,6 +231,18 @@ func buildManifest(s *schema.Schema) []fieldManifestEntry {
 			Name:    fe.Name,
 			Indexed: fe.Indexed,
 			Unique:  fe.Unique,
+		})
+	}
+	for _, field := range s.VectorFields() {
+		metric := field.VectorMetric
+		if metric == "" {
+			metric = "cosine"
+		}
+		entries = append(entries, fieldManifestEntry{
+			Name:   field.Name,
+			Vector: true,
+			Dim:    field.VectorDim,
+			Metric: metric,
 		})
 	}
 	return entries
@@ -402,6 +441,26 @@ func versionKey(bucket string) []byte {
 // bucket satisfy — it allows the migration logic to call rebuildFieldIndexes.
 type migrator interface {
 	rebuildFieldIndexes(btx *badger.Txn, fields []*fieldEncoder) error
+}
+
+func (db *DB) readSchemaFingerprint(bucket string) (string, error) {
+	var fingerprint string
+	err := db.bdb.View(func(btx *badger.Txn) error {
+		item, err := btx.Get(metaKey(bucket))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		value, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		fingerprint = string(value)
+		return nil
+	})
+	return fingerprint, err
 }
 
 // ensureSchemaOrMigrate is called by RegisterBucket. It handles three cases:

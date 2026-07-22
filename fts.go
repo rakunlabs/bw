@@ -432,7 +432,7 @@ func (fi *ftsIndex) readStats(btx *badger.Txn) (uint64, uint64, error) {
 // descending BM25 score. The query is tokenised with the same
 // Tokenizer used at index time, then ANDed across every FTS field of
 // the bucket.
-func (fi *ftsIndex) search(db *DB, queryStr string, limit, offset int) ([]SearchHit, uint64, error) {
+func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) ([]SearchHit, uint64, error) {
 	fi.mu.RLock()
 	defer fi.mu.RUnlock()
 
@@ -461,7 +461,7 @@ func (fi *ftsIndex) search(db *DB, queryStr string, limit, offset int) ([]Search
 	docs := make(map[string]*docState)
 
 	var docCount, sumLen uint64
-	err := db.bdb.View(func(btx *badger.Txn) error {
+	err := func() error {
 		var sErr error
 		docCount, sumLen, sErr = fi.readStats(btx)
 		if sErr != nil {
@@ -519,7 +519,7 @@ func (fi *ftsIndex) search(db *DB, queryStr string, limit, offset int) ([]Search
 			}
 		}
 		return nil
-	})
+	}()
 	if err != nil {
 		return nil, 0, err
 	}

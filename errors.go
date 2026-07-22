@@ -30,4 +30,7 @@ var (
 	// ErrVectorEmpty is returned when an empty vector is passed where
 	// a non-empty one is required.
 	ErrVectorEmpty = errors.New("bw: vector is empty")
+	// ErrStaleBucket is returned when a schema migration or restore has
+	// invalidated an existing typed bucket handle.
+	ErrStaleBucket = errors.New("bw: bucket handle is stale; register it again")
 )

@@ -58,6 +58,10 @@ type Bucket[T any] struct {
 	// vecIdx is the vector index for this bucket, or nil when no
 	// vector-tagged field exists.
 	vecIdx *vectorIndex
+	// Requested HNSW settings are stored until the vector handle is
+	// opened later in registration.
+	vectorM              int
+	vectorEfConstruction int
 
 	// embedder, when non-nil, is invoked for every Insert whose
 	// vector field is empty so the caller can ship plain records and
@@ -73,6 +77,14 @@ type Bucket[T any] struct {
 	// migrationProgress is an optional hook fired between batches
 	// during user migration runs. See WithMigrationProgress.
 	migrationProgress MigrationProgress
+	epoch             uint64
+}
+
+func (b *Bucket[T]) checkCurrent() error {
+	if b.epoch != b.db.bucketEpoch(b.name) {
+		return ErrStaleBucket
+	}
+	return nil
 }
 
 // BucketOption configures a Bucket at registration time.
@@ -107,18 +119,11 @@ func WithVersion[T any](v uint64) BucketOption[T] {
 // insert.
 func WithVectorParams[T any](M, efConstruction int) BucketOption[T] {
 	return func(b *Bucket[T]) {
-		// Stash on the bucket; openVectorIndex has already been
-		// called by RegisterBucket but b.vecIdx is the one
-		// instance, so we patch its tunables directly. If
-		// vector tag is absent the option is silently ignored.
-		if b.vecIdx == nil {
-			return
-		}
 		if M > 0 {
-			b.vecIdx.wantM = M
+			b.vectorM = M
 		}
 		if efConstruction > 0 {
-			b.vecIdx.wantEfConstruction = efConstruction
+			b.vectorEfConstruction = efConstruction
 		}
 	}
 }
@@ -159,6 +164,8 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 	if err := validateBucketName(name); err != nil {
 		return nil, err
 	}
+	db.schemaMu.Lock()
+	defer db.schemaMu.Unlock()
 
 	var zero T
 	s, err := schema.Of(reflect.TypeOf(zero))
@@ -171,11 +178,39 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		codec:  db.codec,
 		name:   name,
 		schema: s,
+		epoch:  db.trackBucket(name),
 	}
 	for _, o := range opts {
 		o(b)
 	}
-
+	storedFingerprint, err := db.readSchemaFingerprint(name)
+	if err != nil {
+		return nil, err
+	}
+	schemaChanged := storedFingerprint != "" && storedFingerprint != s.Fingerprint()
+	if schemaChanged {
+		if b.version == 0 {
+			return nil, fmt.Errorf("bw: schema fingerprint mismatch for bucket %q (have %s, want %s); migrate or pick a new bucket name",
+				name, storedFingerprint, s.Fingerprint())
+		}
+		storedVersion, err := b.readStoredVersion()
+		if err != nil {
+			return nil, err
+		}
+		if b.version <= storedVersion {
+			return nil, fmt.Errorf("bw: schema fingerprint mismatch for bucket %q but version %d <= stored %d; bump WithVersion to trigger migration",
+				name, b.version, storedVersion)
+		}
+		b.epoch = db.invalidateBucket(name)
+	} else if b.version > 0 && len(b.userMigrations) > 0 {
+		storedVersion, err := b.readStoredVersion()
+		if err != nil {
+			return nil, err
+		}
+		if storedVersion < b.version {
+			b.epoch = db.invalidateBucket(name)
+		}
+	}
 	if b.keyFn == nil {
 		if s.PK == nil {
 			return nil, fmt.Errorf("bw: type %s has no `pk` tag and no WithKeyFn provided", s.Type.Name())
@@ -224,29 +259,24 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 	// write fires.
 	ftsFields := s.FTSFields()
 	if len(ftsFields) > 0 {
-		if existing := db.fts.get(name); existing != nil {
-			b.ftsIdx = existing
-		} else {
-			fi, err := openFTSIndex(db, name, ftsFields)
-			if err != nil {
-				return nil, err
-			}
-			b.ftsIdx = fi
-			db.fts.set(name, fi)
+		fi, err := openFTSIndex(db, name, ftsFields)
+		if err != nil {
+			return nil, err
 		}
+		b.ftsIdx = fi
+		db.fts.set(name, fi)
 	}
 	vecFields := s.VectorFields()
 	if len(vecFields) > 0 {
-		if existing := db.vec.get(name); existing != nil {
-			b.vecIdx = existing
-		} else {
-			vi, err := openVectorIndex(db, name, vecFields)
-			if err != nil {
-				return nil, err
-			}
-			b.vecIdx = vi
-			db.vec.set(name, vi)
+		vi, err := openVectorIndex(db, name, vecFields)
+		if err != nil {
+			return nil, err
 		}
+		if err := vi.configure(db, b.vectorM, b.vectorEfConstruction); err != nil {
+			return nil, err
+		}
+		b.vecIdx = vi
+		db.vec.set(name, vi)
 	}
 
 	// User migrations run BEFORE the schema reconcile step so a
@@ -261,6 +291,9 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 	}
 	if _, err := b.runUserMigrations(context.Background(), storedV); err != nil {
 		return nil, err
+	}
+	if err := b.reconcileVectorStorage(context.Background()); err != nil {
+		return nil, fmt.Errorf("bw: reconcile vector schema: %w", err)
 	}
 
 	if err := db.ensureSchemaOrMigrate(name, s, b.version, b); err != nil {
@@ -321,40 +354,34 @@ func (b *Bucket[T]) Name() string { return b.name }
 // If the schema declares a `unique` field whose value is already owned by
 // another pk, ErrConflict is returned and the transaction is rolled back.
 func (b *Bucket[T]) Insert(ctx context.Context, record *T) error {
-	_ = ctx
-
-	return b.db.Update(func(tx *Tx) error { return b.upsertTx(tx, record, false) })
+	return b.db.Update(func(tx *Tx) error { return b.upsertTx(ctx, tx, record, false) })
 }
 
 // InsertNew is like Insert but returns ErrConflict if the primary key
 // already exists. Use it when you want strict create-only semantics.
 func (b *Bucket[T]) InsertNew(ctx context.Context, record *T) error {
-	_ = ctx
-
-	return b.db.Update(func(tx *Tx) error { return b.upsertTx(tx, record, true) })
+	return b.db.Update(func(tx *Tx) error { return b.upsertTx(ctx, tx, record, true) })
 }
 
 // InsertTx is like Insert but operates on a caller-controlled transaction.
 // Use it to batch multiple writes into a single atomic commit.
 func (b *Bucket[T]) InsertTx(tx *Tx, record *T) error {
-	return b.upsertTx(tx, record, false)
+	return b.upsertTx(context.Background(), tx, record, false)
 }
 
 // InsertNewTx is like InsertNew but operates on a caller-controlled
 // transaction. Returns ErrConflict if the primary key already exists.
 func (b *Bucket[T]) InsertNewTx(tx *Tx, record *T) error {
-	return b.upsertTx(tx, record, true)
+	return b.upsertTx(context.Background(), tx, record, true)
 }
 
 // InsertMany inserts all records in a single read-write transaction.
 // If any record fails (e.g. a unique constraint violation), the entire
 // batch is rolled back and the error is returned.
 func (b *Bucket[T]) InsertMany(ctx context.Context, records []*T) error {
-	_ = ctx
-
 	return b.db.Update(func(tx *Tx) error {
 		for _, rec := range records {
-			if err := b.upsertTx(tx, rec, false); err != nil {
+			if err := b.upsertTx(ctx, tx, rec, false); err != nil {
 				return err
 			}
 		}
@@ -371,7 +398,7 @@ func (b *Bucket[T]) Update(ctx context.Context, record *T) error {
 
 // UpdateTx is like Update but operates on a caller-controlled transaction.
 func (b *Bucket[T]) UpdateTx(tx *Tx, record *T) error {
-	return b.upsertTx(tx, record, false)
+	return b.upsertTx(context.Background(), tx, record, false)
 }
 
 // FindAndUpdate finds all records matching q, calls fn on each one, and
@@ -384,8 +411,6 @@ func (b *Bucket[T]) UpdateTx(tx *Tx, record *T) error {
 // If fn returns an error, the entire transaction is rolled back.
 // Sort, Offset, and Limit from q are honoured before fn is called.
 func (b *Bucket[T]) FindAndUpdate(ctx context.Context, q *query.Query, fn func(*T) (*T, error)) error {
-	_ = ctx
-
 	scanQ, sortSpec, offset, limit := splitSortPaging(q)
 
 	return b.db.Update(func(tx *Tx) error {
@@ -416,7 +441,7 @@ func (b *Bucket[T]) FindAndUpdate(ctx context.Context, q *query.Query, fn func(*
 			if updated == nil {
 				continue
 			}
-			if err := b.upsertTx(tx, updated, false); err != nil {
+			if err := b.upsertTx(ctx, tx, updated, false); err != nil {
 				return err
 			}
 		}
@@ -428,6 +453,18 @@ func (b *Bucket[T]) FindAndUpdate(ctx context.Context, q *query.Query, fn func(*
 // DeleteTx removes the record with the given key within a caller-controlled
 // transaction. Idempotent: deleting a missing key returns nil.
 func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
+	if err := b.checkCurrent(); err != nil {
+		return err
+	}
+	if tx == nil {
+		return fmt.Errorf("bw: nil transaction")
+	}
+	if tx.db != b.db {
+		return fmt.Errorf("bw: transaction belongs to another database")
+	}
+	if !tx.rw {
+		return ErrReadOnlyTx
+	}
 	pk, err := keyAsBytes(key)
 	if err != nil {
 		return err
@@ -474,9 +511,21 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 
 // upsertTx implements both Insert (insertNewOnly=false, overwrite ok) and
 // InsertNew (insertNewOnly=true, ErrConflict on existing pk).
-func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
+func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOnly bool) error {
+	if err := b.checkCurrent(); err != nil {
+		return err
+	}
+	if tx == nil {
+		return fmt.Errorf("bw: nil transaction")
+	}
+	if tx.db != b.db {
+		return fmt.Errorf("bw: transaction belongs to another database")
+	}
 	if !tx.rw {
 		return ErrReadOnlyTx
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	pk, err := b.keyFn(record)
 	if err != nil {
@@ -512,6 +561,22 @@ func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
 		}
 	}
 
+	var vector []float32
+	if b.vecIdx != nil {
+		vector = b.vecIdx.extractVector(record)
+		if vector == nil && b.embedder != nil {
+			vector, err = b.embedder(ctx, record)
+			if err != nil {
+				return fmt.Errorf("bw: embedder: %w", err)
+			}
+			if vector != nil {
+				if err := setVectorField(record, vector, b.schema); err != nil {
+					return fmt.Errorf("bw: embedder: set vector field: %w", err)
+				}
+			}
+		}
+	}
+
 	val, err := b.codec.Marshal(record)
 	if err != nil {
 		return err
@@ -542,18 +607,12 @@ func (b *Bucket[T]) upsertTx(tx *Tx, record *T, insertNewOnly bool) error {
 
 	// Vector field, same atomicity story.
 	if b.vecIdx != nil {
-		v := b.vecIdx.extractVector(record)
-		if v == nil && b.embedder != nil {
-			ev, eErr := b.embedder(context.Background(), record)
-			if eErr != nil {
-				return fmt.Errorf("bw: embedder: %w", eErr)
-			}
-			v = ev
-		}
-		if v != nil {
-			if err := b.vecIdx.writeVec(tx.btx, pk, v); err != nil {
+		if vector != nil {
+			if err := b.vecIdx.writeVec(tx.btx, pk, vector); err != nil {
 				return fmt.Errorf("bw: vector write: %w", err)
 			}
+		} else if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
+			return fmt.Errorf("bw: vector delete: %w", err)
 		}
 	}
 
@@ -599,6 +658,12 @@ func (b *Bucket[T]) GetTx(tx *Tx, key any) (*T, error) {
 // getTx is the shared implementation for Get and GetTx. The caller
 // must supply the transaction; both rw and read-only txs are accepted.
 func (b *Bucket[T]) getTx(tx *Tx, key any) (*T, error) {
+	if err := b.checkCurrent(); err != nil {
+		return nil, err
+	}
+	if tx.db != b.db {
+		return nil, fmt.Errorf("bw: transaction belongs to another database")
+	}
 	pk, err := keyAsBytes(key)
 	if err != nil {
 		return nil, err
@@ -626,12 +691,18 @@ func (b *Bucket[T]) getTx(tx *Tx, key any) (*T, error) {
 // returns nil.
 func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 	_ = ctx
+	if err := b.checkCurrent(); err != nil {
+		return err
+	}
 	pk, err := keyAsBytes(key)
 	if err != nil {
 		return err
 	}
 
 	return b.db.Update(func(tx *Tx) error {
+		if err := b.checkCurrent(); err != nil {
+			return err
+		}
 		dKey := dataKey(b.name, pk)
 		if b.hasMaintenance {
 			item, gerr := tx.btx.Get(dKey)
@@ -712,6 +783,12 @@ func (b *Bucket[T]) FindTx(tx *Tx, q *query.Query) ([]*T, error) {
 
 // findTx is the shared implementation for Find and FindTx.
 func (b *Bucket[T]) findTx(tx *Tx, q *query.Query) ([]*T, error) {
+	if err := b.checkCurrent(); err != nil {
+		return nil, err
+	}
+	if tx.db != b.db {
+		return nil, fmt.Errorf("bw: transaction belongs to another database")
+	}
 	// Strip Sort/Offset/Limit from the engine's view of q: we apply
 	// them on the typed slice ourselves so each record is decoded only
 	// once.
@@ -757,6 +834,12 @@ func (b *Bucket[T]) WalkTx(tx *Tx, q *query.Query, fn func(*T) error) error {
 
 // walkTx is the shared implementation for Walk and WalkTx.
 func (b *Bucket[T]) walkTx(tx *Tx, q *query.Query, fn func(*T) error) error {
+	if err := b.checkCurrent(); err != nil {
+		return err
+	}
+	if tx.db != b.db {
+		return fmt.Errorf("bw: transaction belongs to another database")
+	}
 	plan := b.plan(q)
 	walkFn := func(m engine.Match) error {
 		rec := new(T)
@@ -850,6 +933,12 @@ func (b *Bucket[T]) CountTx(tx *Tx, q *query.Query) (uint64, error) {
 
 // countTx is the shared implementation for Count and CountTx.
 func (b *Bucket[T]) countTx(tx *Tx, q *query.Query) (uint64, error) {
+	if err := b.checkCurrent(); err != nil {
+		return 0, err
+	}
+	if tx.db != b.db {
+		return 0, fmt.Errorf("bw: transaction belongs to another database")
+	}
 	// Drop offset/limit/sort while counting; Count's contract ignores
 	// those even when present in q.
 	var qq *query.Query
@@ -908,6 +997,9 @@ type SearchResult[T any] struct {
 // limit and offset control pagination (0 limit means default 10).
 func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int) ([]SearchResult[T], uint64, error) {
 	_ = ctx
+	if err := b.checkCurrent(); err != nil {
+		return nil, 0, err
+	}
 
 	if b.ftsIdx == nil {
 		return nil, 0, ErrNoFTS
@@ -917,13 +1009,20 @@ func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int)
 		limit = 10
 	}
 
-	hits, total, err := b.ftsIdx.search(b.db, query, limit, offset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("bw: search: %w", err)
-	}
-
-	results := make([]SearchResult[T], 0, len(hits))
-	err = b.db.View(func(tx *Tx) error {
+	var (
+		results []SearchResult[T]
+		total   uint64
+	)
+	err := b.db.View(func(tx *Tx) error {
+		if err := b.checkCurrent(); err != nil {
+			return err
+		}
+		hits, hitCount, err := b.ftsIdx.search(tx.btx, query, limit, offset)
+		if err != nil {
+			return fmt.Errorf("bw: search: %w", err)
+		}
+		total = hitCount
+		results = make([]SearchResult[T], 0, len(hits))
 		for _, h := range hits {
 			pk := []byte(h.ID)
 			item, getErr := tx.btx.Get(dataKey(b.name, pk))
@@ -965,8 +1064,12 @@ func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int)
 // the planner understands is fast) and the vector pass only sees pks
 // that survived the filter.
 func (b *Bucket[T]) SearchVector(ctx context.Context, q []float32, opts ...SearchVectorOptions) ([]VectorHit[T], error) {
-	_ = ctx
-
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := b.checkCurrent(); err != nil {
+		return nil, err
+	}
 	if b.vecIdx == nil {
 		return nil, ErrNoVector
 	}
@@ -986,37 +1089,41 @@ func (b *Bucket[T]) SearchVector(ctx context.Context, q []float32, opts ...Searc
 		metric = b.vecIdx.defaultM
 	}
 
-	// Resolve the filter into a pk allow-set when present. We use
-	// the typed Find path so indexed predicates are cheap.
-	var allowed map[string]struct{}
-	if so.Filter != nil {
-		qq, ok := so.Filter.(*query.Query)
-		if !ok {
-			return nil, fmt.Errorf("bw: SearchVector Filter must be *query.Query, got %T", so.Filter)
-		}
-		matches, err := b.Find(ctx, qq)
-		if err != nil {
-			return nil, err
-		}
-		if len(matches) == 0 {
-			return nil, nil
-		}
-		allowed = make(map[string]struct{}, len(matches))
-		for _, m := range matches {
-			pk, kerr := b.keyFn(m)
-			if kerr != nil {
-				return nil, kerr
-			}
-			allowed[string(pk)] = struct{}{}
-		}
-	}
-
 	out := make([]VectorHit[T], 0, so.K)
-	err := b.vecIdx.search(b.db, q, so.K, so.EfSearch, metric, allowed, func(pk []byte, score float64) error {
-		// Hydrate the record. Use a fresh read txn per call rather
-		// than a shared one so search results stay close to the
-		// committed view at the moment SearchVector returned.
-		return b.db.View(func(tx *Tx) error {
+	err := b.db.View(func(tx *Tx) error {
+		if err := b.checkCurrent(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Filter resolution, vector ranking, and hydration share this
+		// transaction so every hit comes from one coherent snapshot.
+		var allowed map[string]struct{}
+		if so.Filter != nil {
+			qq, ok := so.Filter.(*query.Query)
+			if !ok {
+				return fmt.Errorf("bw: SearchVector Filter must be *query.Query, got %T", so.Filter)
+			}
+			matches, err := b.findTx(tx, qq)
+			if err != nil {
+				return err
+			}
+			if len(matches) == 0 {
+				return nil
+			}
+			allowed = make(map[string]struct{}, len(matches))
+			for _, match := range matches {
+				pk, err := b.keyFn(match)
+				if err != nil {
+					return err
+				}
+				allowed[string(pk)] = struct{}{}
+			}
+		}
+
+		err := b.vecIdx.search(tx.btx, q, so.K, so.EfSearch, metric, allowed, func(pk []byte, score float64) error {
 			item, gErr := tx.btx.Get(dataKey(b.name, pk))
 			if gErr != nil {
 				if errors.Is(gErr, badger.ErrKeyNotFound) {
@@ -1033,9 +1140,307 @@ func (b *Bucket[T]) SearchVector(ctx context.Context, q []float32, opts ...Searc
 			out = append(out, VectorHit[T]{Record: rec, Score: score})
 			return nil
 		})
+		if err != nil {
+			return fmt.Errorf("bw: vector search: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("bw: vector search: %w", err)
+		return nil, err
 	}
 	return out, nil
+}
+
+// CompactVectors removes tombstoned and orphaned vector values and rebuilds
+// the HNSW graph from the remaining live vectors. Reads and writes are paused
+// while the graph is rebuilt so callers never observe a partial index.
+func (b *Bucket[T]) CompactVectors(ctx context.Context) error {
+	if b.vecIdx == nil {
+		return ErrNoVector
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.db.schemaMu.Lock()
+	defer b.db.schemaMu.Unlock()
+	b.db.accessMu.Lock()
+	defer b.db.accessMu.Unlock()
+	b.db.writeMu.Lock()
+	defer b.db.writeMu.Unlock()
+	if err := b.checkCurrent(); err != nil {
+		return err
+	}
+	return b.vecIdx.compact(ctx, b.db)
+}
+
+// reconcileVectorStorage aligns the persisted vector namespace with the
+// current schema. It is used during registration after user migrations have
+// transformed the records into their final shape.
+func (b *Bucket[T]) reconcileVectorStorage(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.db.accessMu.Lock()
+	defer b.db.accessMu.Unlock()
+	b.db.writeMu.Lock()
+	defer b.db.writeMu.Unlock()
+	pending, err := b.vectorReconcilePending()
+	if err != nil {
+		return err
+	}
+
+	fields, err := vectorFieldsOnDisk(b.db, b.name)
+	if err != nil {
+		return err
+	}
+	if b.vecIdx == nil {
+		if len(fields) == 0 && !pending {
+			return nil
+		}
+		if err := b.db.bdb.Update(func(btx *badger.Txn) error {
+			return btx.Set(vectorReconcileKey(b.name), []byte{1})
+		}); err != nil {
+			return err
+		}
+		if err := wipeVectorBucket(b.db, b.name); err != nil {
+			return err
+		}
+		return b.db.bdb.Update(func(btx *badger.Txn) error {
+			return btx.Delete(vectorReconcileKey(b.name))
+		})
+	}
+
+	var base vectorManifest
+	if len(fields) > 0 {
+		base, err = readVectorManifestForField(b.db, b.name, fields[0])
+		if err != nil {
+			return err
+		}
+	}
+	if len(fields) == 1 && fields[0] == b.vecIdx.field.Name {
+		compactPending, err := b.vecIdx.maintenancePending(b.db)
+		if err != nil {
+			return err
+		}
+		if compactPending {
+			return b.vecIdx.compact(ctx, b.db)
+		}
+		metric := VectorMetric(base.Metric)
+		if metric == MetricDefault {
+			metric = Cosine
+		}
+		dimMatches := b.vecIdx.field.VectorDim == 0 || base.Dim == 0 || int(base.Dim) == b.vecIdx.field.VectorDim
+		if dimMatches && metric == b.vecIdx.defaultM && !pending {
+			return nil
+		}
+	}
+
+	oldVectors := make(map[string][]float32)
+	for _, field := range fields {
+		prefix := vecRawPrefix(b.name, field)
+		err := b.db.bdb.View(func(btx *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			opts.Prefix = prefix
+			it := btx.NewIterator(opts)
+			defer it.Close()
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				pk := append([]byte(nil), pkFromVecRawKey(it.Item().KeyCopy(nil), prefix)...)
+				if _, err := btx.Get(vecTombKey(b.name, field, pk)); err == nil {
+					continue
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+				var vector []float32
+				if err := it.Item().Value(func(raw []byte) error {
+					var err error
+					vector, err = decodeVector(raw)
+					return err
+				}); err != nil {
+					return err
+				}
+				oldVectors[string(pk)] = vector
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	type rebuildRecord struct {
+		pk     []byte
+		record *T
+	}
+	var records []rebuildRecord
+	prefix := dataPrefix(b.name)
+	err = b.db.bdb.View(func(btx *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := btx.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			pk := append([]byte(nil), it.Item().Key()[len(prefix):]...)
+			record := new(T)
+			if err := it.Item().Value(func(raw []byte) error {
+				return b.codec.Unmarshal(raw, record)
+			}); err != nil {
+				return err
+			}
+			vector := b.vecIdx.extractVector(record)
+			if vector == nil {
+				vector = oldVectors[string(pk)]
+			}
+			if vector == nil && b.embedder != nil {
+				var err error
+				vector, err = b.embedder(ctx, record)
+				if err != nil {
+					return fmt.Errorf("bw: embedder: %w", err)
+				}
+			}
+			if vector == nil {
+				continue
+			}
+			if err := validateVector(vector); err != nil {
+				return err
+			}
+			if dim := b.vecIdx.field.VectorDim; dim > 0 && len(vector) != dim {
+				return fmt.Errorf("%w: schema declares dim=%d, got %d", ErrDimMismatch, dim, len(vector))
+			}
+			if err := setVectorField(record, vector, b.schema); err != nil {
+				return err
+			}
+			records = append(records, rebuildRecord{pk: pk, record: record})
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := b.db.bdb.Update(func(btx *badger.Txn) error {
+		return btx.Set(vectorReconcileKey(b.name), []byte{1})
+	}); err != nil {
+		return err
+	}
+	// Persist vectors recovered from the old raw namespace before it is
+	// removed, so a crash can resume entirely from data records.
+	for _, item := range records {
+		encoded, err := b.codec.Marshal(item.record)
+		if err != nil {
+			return err
+		}
+		if err := b.db.bdb.Update(func(btx *badger.Txn) error {
+			return btx.Set(dataKey(b.name, item.pk), encoded)
+		}); err != nil {
+			return err
+		}
+	}
+
+	if err := wipeVectorBucket(b.db, b.name); err != nil {
+		return err
+	}
+	base.Dim = uint64(b.vecIdx.field.VectorDim)
+	base.Metric = uint64(b.vecIdx.defaultM)
+	base.Count = 0
+	base.MaxLevel = 0
+	if err := b.db.bdb.Update(func(btx *badger.Txn) error {
+		return b.vecIdx.writeManifest(btx, base)
+	}); err != nil {
+		return err
+	}
+	for _, item := range records {
+		if err := b.db.bdb.Update(func(btx *badger.Txn) error {
+			tx := &Tx{db: b.db, btx: btx, rw: true}
+			return b.upsertTx(ctx, tx, item.record, false)
+		}); err != nil {
+			return fmt.Errorf("bw: rebuild vector pk=%x: %w", item.pk, err)
+		}
+	}
+	return b.db.bdb.Update(func(btx *badger.Txn) error {
+		return btx.Delete(vectorReconcileKey(b.name))
+	})
+}
+
+func (b *Bucket[T]) resetVectorStorageForReembed() error {
+	if b.vecIdx == nil {
+		return ErrNoVector
+	}
+	b.db.accessMu.Lock()
+	defer b.db.accessMu.Unlock()
+	b.db.writeMu.Lock()
+	defer b.db.writeMu.Unlock()
+
+	fields, err := vectorFieldsOnDisk(b.db, b.name)
+	if err != nil {
+		return err
+	}
+	var man vectorManifest
+	if len(fields) > 0 {
+		man, err = readVectorManifestForField(b.db, b.name, fields[0])
+		if err != nil {
+			return err
+		}
+	}
+	if err := wipeVectorBucket(b.db, b.name); err != nil {
+		return err
+	}
+	man.Dim = uint64(b.vecIdx.field.VectorDim)
+	man.Metric = uint64(b.vecIdx.defaultM)
+	man.Count = 0
+	man.MaxLevel = 0
+	return b.db.bdb.Update(func(btx *badger.Txn) error {
+		return b.vecIdx.writeManifest(btx, man)
+	})
+}
+
+func (b *Bucket[T]) vectorStorageNeedsRebuild() (bool, error) {
+	pending, err := b.vectorReconcilePending()
+	if err != nil || pending {
+		return pending, err
+	}
+	fields, err := vectorFieldsOnDisk(b.db, b.name)
+	if err != nil {
+		return false, err
+	}
+	if b.vecIdx == nil {
+		return len(fields) > 0, nil
+	}
+	if len(fields) != 1 || fields[0] != b.vecIdx.field.Name {
+		return true, nil
+	}
+	man, err := readVectorManifestForField(b.db, b.name, fields[0])
+	if err != nil {
+		return false, err
+	}
+	compactPending, err := b.vecIdx.maintenancePending(b.db)
+	if err != nil {
+		return false, err
+	}
+	if compactPending {
+		return true, nil
+	}
+	metric := VectorMetric(man.Metric)
+	if metric == MetricDefault {
+		metric = Cosine
+	}
+	dimMatches := b.vecIdx.field.VectorDim == 0 || man.Dim == 0 || int(man.Dim) == b.vecIdx.field.VectorDim
+	return !dimMatches || metric != b.vecIdx.defaultM, nil
+}
+
+func (b *Bucket[T]) vectorReconcilePending() (bool, error) {
+	var pending bool
+	err := b.db.bdb.View(func(btx *badger.Txn) error {
+		_, err := btx.Get(vectorReconcileKey(b.name))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		pending = true
+		return nil
+	})
+	return pending, err
 }

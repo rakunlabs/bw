@@ -128,6 +128,10 @@ func TestFTS_IncrementalBackupCarriesFTS(t *testing.T) {
 	if err := dst.Restore(&full); err != nil {
 		t.Fatal(err)
 	}
+	dstBucket, err = bw.RegisterBucket[SearchableArticle](dst, "events")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Source advances.
 	if err := srcBucket.Insert(ctx, &SearchableArticle{ID: "2", Title: "beta", Body: "needle"}); err != nil {
@@ -142,7 +146,7 @@ func TestFTS_IncrementalBackupCarriesFTS(t *testing.T) {
 	if _, err := src.Backup(&incr, baselineV, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := dst.Restore(&incr); err != nil {
+	if err := dst.ApplyBackup(&incr); err != nil {
 		t.Fatal(err)
 	}
 

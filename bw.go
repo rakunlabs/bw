@@ -14,6 +14,8 @@
 package bw
 
 import (
+	"sync"
+
 	"github.com/dgraph-io/badger/v4"
 	"github.com/rakunlabs/bw/codec"
 )
@@ -26,6 +28,71 @@ type DB struct {
 	path  string          // filesystem path; empty for in-memory databases
 	fts   *ftsRegistry    // full-text search indexes
 	vec   *vectorRegistry // vector search indexes
+
+	// Index and HNSW maintenance update shared keys. Holding this lock
+	// for the full write transaction lifetime keeps those read-modify-
+	// write operations safe even when Badger conflict detection is off.
+	writeMu sync.Mutex
+	// schemaMu serializes registration/migration with destructive or
+	// schema-bearing backup maintenance.
+	schemaMu sync.Mutex
+	// Destructive maintenance takes the write side while ordinary
+	// transactions hold a read lock for their complete lifetime.
+	accessMu  maintenanceGate
+	runtimeMu sync.RWMutex
+	epochs    map[string]uint64
+}
+
+// maintenanceGate blocks new transactions only while maintenance is active.
+// It deliberately allows readers while maintenance is waiting, so callbacks
+// can safely perform nested reads.
+type maintenanceGate struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	readers int
+	writer  bool
+	waiting int
+}
+
+func (g *maintenanceGate) init() { g.cond = sync.NewCond(&g.mu) }
+
+func (g *maintenanceGate) RLock() {
+	g.mu.Lock()
+	// Readers already inside a callback may open a nested read while a
+	// writer waits. Once the active reader group drains to zero, waiting
+	// writers get priority over a new group.
+	for g.writer || (g.waiting > 0 && g.readers == 0) {
+		g.cond.Wait()
+	}
+	g.readers++
+	g.mu.Unlock()
+}
+
+func (g *maintenanceGate) RUnlock() {
+	g.mu.Lock()
+	g.readers--
+	if g.readers == 0 {
+		g.cond.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+func (g *maintenanceGate) Lock() {
+	g.mu.Lock()
+	g.waiting++
+	for g.writer || g.readers > 0 {
+		g.cond.Wait()
+	}
+	g.waiting--
+	g.writer = true
+	g.mu.Unlock()
+}
+
+func (g *maintenanceGate) Unlock() {
+	g.mu.Lock()
+	g.writer = false
+	g.cond.Broadcast()
+	g.mu.Unlock()
 }
 
 // Open opens (or creates) a bw database at the given filesystem path.
@@ -75,13 +142,51 @@ func Open(path string, opts ...Option) (*DB, error) {
 		dbPath = path
 	}
 
-	return &DB{
-		bdb:   bdb,
-		codec: o.codec,
-		path:  dbPath,
-		fts:   newFTSRegistry(),
-		vec:   newVectorRegistry(),
-	}, nil
+	db := &DB{
+		bdb:    bdb,
+		codec:  o.codec,
+		path:   dbPath,
+		fts:    newFTSRegistry(),
+		vec:    newVectorRegistry(),
+		epochs: make(map[string]uint64),
+	}
+	db.accessMu.init()
+	return db, nil
+}
+
+func (db *DB) bucketEpoch(bucket string) uint64 {
+	db.runtimeMu.RLock()
+	defer db.runtimeMu.RUnlock()
+	return db.epochs[bucket]
+}
+
+func (db *DB) trackBucket(bucket string) uint64 {
+	db.runtimeMu.Lock()
+	defer db.runtimeMu.Unlock()
+	epoch := db.epochs[bucket]
+	db.epochs[bucket] = epoch
+	return epoch
+}
+
+func (db *DB) bumpBucketEpoch(bucket string) uint64 {
+	db.runtimeMu.Lock()
+	defer db.runtimeMu.Unlock()
+	db.epochs[bucket]++
+	return db.epochs[bucket]
+}
+
+func (db *DB) invalidateBucket(bucket string) uint64 {
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
+	return db.bumpBucketEpoch(bucket)
+}
+
+func (db *DB) invalidateBucketHandles() {
+	db.runtimeMu.Lock()
+	defer db.runtimeMu.Unlock()
+	for bucket := range db.epochs {
+		db.epochs[bucket]++
+	}
 }
 
 // Close closes the underlying Badger database. The full-text-search
@@ -125,22 +230,11 @@ func (db *DB) Wipe() error {
 	if db == nil || db.bdb == nil {
 		return nil
 	}
-	if err := db.bdb.DropAll(); err != nil {
-		return err
-	}
-	// FTS and vector state live as Badger keys, so DropAll has
-	// already removed them. The registry resets here are kept for
-	// symmetry and as a hook for future implementations that may
-	// hold off-Badger state.
-	if db.fts != nil {
-		if err := db.fts.resetAll(db); err != nil {
-			return err
-		}
-	}
-	if db.vec != nil {
-		if err := db.vec.resetAll(db); err != nil {
-			return err
-		}
-	}
-	return nil
+	db.schemaMu.Lock()
+	defer db.schemaMu.Unlock()
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	return db.bdb.DropAll()
 }

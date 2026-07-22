@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 
@@ -21,6 +22,8 @@ var maxPendingWrites = 256
 // delete markers. When true, it walks all versions (including deletes) so the
 // backup can later be used with BackupUntil for point-in-time restore.
 func (db *DB) Backup(w io.Writer, since uint64, deletedData bool) (uint64, error) {
+	db.accessMu.RLock()
+	defer db.accessMu.RUnlock()
 	slog.Info("backup database", slog.Uint64("since", since))
 
 	if !deletedData {
@@ -39,6 +42,8 @@ func (db *DB) Backup(w io.Writer, since uint64, deletedData bool) (uint64, error
 // It iterates through all versions of each key (including past delete markers)
 // so that older live versions are included when their version falls within range.
 func (db *DB) BackupUntil(w io.Writer, until uint64) (uint64, error) {
+	db.accessMu.RLock()
+	defer db.accessMu.RUnlock()
 	slog.Info("backup database", slog.Uint64("until", until))
 
 	stream := db.bdb.NewStream()
@@ -59,11 +64,121 @@ func (db *DB) BackupUntil(w io.Writer, until uint64) (uint64, error) {
 // same view of every Bucket[T].Search the source produced. No rebuild
 // step is required.
 func (db *DB) Restore(r io.Reader) error {
+	db.schemaMu.Lock()
+	defer db.schemaMu.Unlock()
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if err := db.bdb.DropAll(); err != nil {
+		return err
+	}
+	db.invalidateBucketHandles()
+	if db.fts != nil {
+		db.fts.closeAll()
+	}
+	if db.vec != nil {
+		db.vec.closeAll()
+	}
 	if err := db.bdb.Load(r, maxPendingWrites); err != nil {
 		return err
 	}
 	slog.Info("restored database")
 	return nil
+}
+
+// ApplyBackup merges a full or incremental backup into the current
+// database. Unlike Restore, keys absent from the stream are retained.
+func (db *DB) ApplyBackup(r io.Reader) error {
+	db.schemaMu.Lock()
+	defer db.schemaMu.Unlock()
+	db.accessMu.Lock()
+	defer db.accessMu.Unlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	before, err := db.captureBucketBackupState()
+	if err != nil {
+		return err
+	}
+	if err := db.bdb.Load(r, maxPendingWrites); err != nil {
+		db.invalidateBucketHandles()
+		if db.fts != nil {
+			db.fts.closeAll()
+		}
+		if db.vec != nil {
+			db.vec.closeAll()
+		}
+		return err
+	}
+	after, err := db.captureBucketBackupState()
+	if err != nil {
+		db.invalidateBucketHandles()
+		return err
+	}
+	for bucket, oldState := range before {
+		if after[bucket] != oldState {
+			db.bumpBucketEpoch(bucket)
+		}
+	}
+	slog.Info("applied database backup")
+	return nil
+}
+
+type bucketBackupState struct {
+	fingerprint string
+	version     uint64
+	dim         uint64
+	metric      uint64
+	m           uint64
+	ef          uint64
+}
+
+func (db *DB) captureBucketBackupState() (map[string]bucketBackupState, error) {
+	db.runtimeMu.RLock()
+	buckets := make([]string, 0, len(db.epochs))
+	for bucket := range db.epochs {
+		buckets = append(buckets, bucket)
+	}
+	db.runtimeMu.RUnlock()
+
+	states := make(map[string]bucketBackupState, len(buckets))
+	for _, bucket := range buckets {
+		fingerprint, err := db.readSchemaFingerprint(bucket)
+		if err != nil {
+			return nil, err
+		}
+		state := bucketBackupState{fingerprint: fingerprint}
+		err = db.bdb.View(func(btx *badger.Txn) error {
+			item, err := btx.Get(versionKey(bucket))
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			return item.Value(func(raw []byte) error {
+				if len(raw) == 8 {
+					state.version = binary.BigEndian.Uint64(raw)
+				}
+				return nil
+			})
+		})
+		if err != nil {
+			return nil, err
+		}
+		if vi := db.vec.get(bucket); vi != nil {
+			man, err := readVectorManifestForField(db, bucket, vi.field.Name)
+			if err != nil {
+				return nil, err
+			}
+			state.dim = man.Dim
+			state.metric = man.Metric
+			state.m = man.M
+			state.ef = man.EfConstruction
+		}
+		states[bucket] = state
+	}
+	return states, nil
 }
 
 // Version returns the maximum committed transaction version in the database.
