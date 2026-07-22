@@ -204,6 +204,26 @@ func pkFromPostingKey(key, termPrefix []byte) []byte {
 	return key[len(termPrefix):]
 }
 
+// termAndPKFromPostingKey splits a posting key into its term and pk
+// segments. fieldPrefix must equal ftsPostingFieldPrefix(bucket, field).
+// The layout after fieldPrefix is lp(term) followed by the raw pk.
+// Returns (nil, nil) on a malformed key.
+func termAndPKFromPostingKey(key, fieldPrefix []byte) (term, pk []byte) {
+	if len(key) < len(fieldPrefix) {
+		return nil, nil
+	}
+	rest := key[len(fieldPrefix):]
+	termLen, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return nil, nil
+	}
+	rest = rest[n:]
+	if uint64(len(rest)) < termLen {
+		return nil, nil
+	}
+	return rest[:termLen], rest[termLen:]
+}
+
 // ftsDoclenKey returns the per-doc length key.
 func ftsDoclenKey(bucket string, pk []byte) []byte {
 	bp := ftsBucketPrefix(bucket)

@@ -16,6 +16,30 @@ type Tx struct {
 	done bool
 
 	release func()
+
+	// afterCommit holds callbacks run only after a successful commit, in
+	// registration order. Used to apply in-memory side effects (e.g.
+	// vector-cache invalidation) that must not take effect until the
+	// write is durable, so a concurrent reader cannot repopulate a cache
+	// with a value the txn later rolls back.
+	afterCommit []func()
+}
+
+// OnCommit registers fn to run after this transaction commits
+// successfully. On a read-only transaction or a discarded/rolled-back
+// write, fn never runs. Callbacks run synchronously in Commit.
+func (tx *Tx) OnCommit(fn func()) {
+	if fn != nil {
+		tx.afterCommit = append(tx.afterCommit, fn)
+	}
+}
+
+// runAfterCommit fires the post-commit callbacks once.
+func (tx *Tx) runAfterCommit() {
+	for _, fn := range tx.afterCommit {
+		fn()
+	}
+	tx.afterCommit = nil
 }
 
 // View runs fn inside a read-only transaction. The transaction is
@@ -38,10 +62,21 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 	defer db.accessMu.RUnlock()
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
-	return db.bdb.Update(func(btx *badger.Txn) error {
+	var committed *Tx
+	err := db.bdb.Update(func(btx *badger.Txn) error {
 		tx := &Tx{db: db, btx: btx, rw: true}
-		return fn(tx)
+		if err := fn(tx); err != nil {
+			return err
+		}
+		committed = tx
+		return nil
 	})
+	// badger.Update commits only when fn returns nil; fire post-commit
+	// hooks exactly once the write is durable.
+	if err == nil && committed != nil {
+		committed.runAfterCommit()
+	}
+	return err
 }
 
 // Begin starts a read-write transaction. The caller is responsible for
@@ -77,7 +112,11 @@ func (tx *Tx) Commit() error {
 		tx.btx.Discard()
 		return nil
 	}
-	return tx.btx.Commit()
+	if err := tx.btx.Commit(); err != nil {
+		return err
+	}
+	tx.runAfterCommit()
+	return nil
 }
 
 // Discard releases the transaction without committing.

@@ -50,10 +50,10 @@ func TestDecodeNameMsg_Malformed(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		{},
-		{0x01},             // tag but no length byte
-		{0x01, 0x00},       // zero-length name
-		{0x01, 0x05, 'a'},  // name length 5 but only 1 byte present
-		{0x01, 0xFF, 'a'},  // name length 255 but only 1 byte present
+		{0x01},            // tag but no length byte
+		{0x01, 0x00},      // zero-length name
+		{0x01, 0x05, 'a'}, // name length 5 but only 1 byte present
+		{0x01, 0xFF, 'a'}, // name length 255 but only 1 byte present
 	}
 	for i, data := range cases {
 		_, _, ok := decodeNameMsg(data)

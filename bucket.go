@@ -504,6 +504,7 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 		if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
 			return fmt.Errorf("bw: vector delete: %w", err)
 		}
+		b.vecIdx.invalidateOnCommit(tx, pk)
 	}
 
 	return nil
@@ -614,6 +615,7 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 		} else if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
 			return fmt.Errorf("bw: vector delete: %w", err)
 		}
+		b.vecIdx.invalidateOnCommit(tx, pk)
 	}
 
 	return nil
@@ -737,6 +739,7 @@ func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 			if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
 				return fmt.Errorf("bw: vector delete: %w", err)
 			}
+			b.vecIdx.invalidateOnCommit(tx, pk)
 		}
 
 		return nil
