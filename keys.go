@@ -226,11 +226,17 @@ func termAndPKFromPostingKey(key, fieldPrefix []byte) (term, pk []byte) {
 
 // ftsDoclenKey returns the per-doc length key.
 func ftsDoclenKey(bucket string, pk []byte) []byte {
+	return append(ftsDoclenPrefix(bucket), pk...)
+}
+
+// ftsDoclenPrefix returns the prefix shared by every doc-length key of the
+// bucket, for scanning them as a range.
+func ftsDoclenPrefix(bucket string) []byte {
 	bp := ftsBucketPrefix(bucket)
-	out := make([]byte, 0, len(bp)+len(ftsDoclenMark)+len(pk))
+	out := make([]byte, 0, len(bp)+len(ftsDoclenMark))
 	out = append(out, bp...)
 	out = append(out, ftsDoclenMark...)
-	out = append(out, pk...)
+
 	return out
 }
 

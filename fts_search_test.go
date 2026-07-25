@@ -19,7 +19,7 @@ type Doc struct {
 	Body  string `bw:"body,fts"`
 }
 
-func newDocBucket(t *testing.T, docs []*Doc) (*Bucket[Doc], context.Context) {
+func newDocBucket(t testing.TB, docs []*Doc) (*Bucket[Doc], context.Context) {
 	t.Helper()
 
 	db, err := Open("", WithInMemory(true))
@@ -296,4 +296,84 @@ func TestSearchNilContext(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("results = %#v", results)
 	}
+}
+
+// TestCountAndExistsUseTheIndex pins that the streaming readers go through the
+// query planner. Count used to full-scan the bucket and decode every record
+// even when the predicate was an equality on an indexed field, which made an
+// existence probe cost the whole bucket.
+func TestCountAndExistsUseTheIndex(t *testing.T) {
+	var docs []*Doc
+	for i := range 500 {
+		repo := "bulk"
+		if i == 499 {
+			repo = "needle"
+		}
+		docs = append(docs, &Doc{
+			ID:    fmt.Sprintf("d%03d", i),
+			Repo:  repo,
+			Title: fmt.Sprintf("doc %d", i),
+			Body:  "omicron pi rho",
+		})
+	}
+	bucket, ctx := newDocBucket(t, docs)
+
+	n, err := bucket.Count(ctx, repoFilter("bulk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 499 {
+		t.Fatalf("count = %d, want 499", n)
+	}
+
+	if n, err := bucket.Count(ctx, nil); err != nil || n != 500 {
+		t.Fatalf("unfiltered count = %d, err %v", n, err)
+	}
+
+	for _, tc := range []struct {
+		repo string
+		want bool
+	}{{repo: "needle", want: true}, {repo: "bulk", want: true}, {repo: "absent", want: false}} {
+		got, err := bucket.Exists(ctx, repoFilter(tc.repo))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("Exists(%q) = %v, want %v", tc.repo, got, tc.want)
+		}
+	}
+
+	if got, err := bucket.Exists(ctx, nil); err != nil || !got {
+		t.Fatalf("Exists(nil) = %v, err %v; a non-empty bucket must report true", got, err)
+	}
+}
+
+// BenchmarkExistsVsCount shows why the probe matters: Exists must stop at the
+// first match instead of walking the whole partition.
+func BenchmarkExistsVsCount(b *testing.B) {
+	docs := make([]*Doc, 0, 20000)
+	for i := range 20000 {
+		docs = append(docs, &Doc{
+			ID:    fmt.Sprintf("d%05d", i),
+			Repo:  "bulk",
+			Title: fmt.Sprintf("doc %d", i),
+			Body:  "sigma tau upsilon",
+		})
+	}
+	bucket, ctx := newDocBucket(b, docs)
+
+	b.Run("Exists", func(b *testing.B) {
+		for b.Loop() {
+			if _, err := bucket.Exists(ctx, repoFilter("bulk")); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("Count", func(b *testing.B) {
+		for b.Loop() {
+			if _, err := bucket.Count(ctx, repoFilter("bulk")); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

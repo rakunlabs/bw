@@ -863,6 +863,46 @@ func (b *Bucket[T]) walkTx(tx *Tx, q *query.Query, fn func(*T) error) error {
 	}
 }
 
+// errStopScan aborts a planned scan from its callback.
+var errStopScan = errors.New("bw: stop scan")
+
+// scanMatches runs q under the best available plan and streams every match to
+// fn, which returns false to stop early. It is the shared body of the
+// streaming readers (Count, Exists) so they all benefit from index planning
+// instead of falling back to a full scan.
+func (b *Bucket[T]) scanMatches(tx *Tx, q *query.Query, fn func(engine.Match) (bool, error)) error {
+	plan := b.plan(q)
+
+	walk := func(m engine.Match) error {
+		more, err := fn(m)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return errStopScan
+		}
+
+		return nil
+	}
+
+	var err error
+	switch plan.Kind {
+	case engine.PlanIndexEq, engine.PlanIndexRange:
+		err = engine.IndexWalk(tx.btx, b.indexScanOpts(plan, q), walk)
+	default:
+		err = engine.Walk(tx.btx, engine.ScanOptions{
+			Prefix: dataPrefix(b.name),
+			Codec:  b.codec,
+			Query:  withWhere(q, plan.ResidualWhere),
+		}, walk)
+	}
+	if errors.Is(err, errStopScan) {
+		return nil
+	}
+
+	return err
+}
+
 // scan picks a plan and returns the matching set.
 func (b *Bucket[T]) scan(btx *badger.Txn, q *query.Query) ([]engine.Match, error) {
 	plan := b.plan(q)
@@ -942,30 +982,83 @@ func (b *Bucket[T]) countTx(tx *Tx, q *query.Query) (uint64, error) {
 	if tx.db != b.db {
 		return 0, fmt.Errorf("bw: transaction belongs to another database")
 	}
-	// Drop offset/limit/sort while counting; Count's contract ignores
-	// those even when present in q.
-	var qq *query.Query
-	if q != nil {
-		clone := *q
-		clone.Offset = nil
-		clone.Limit = nil
-		clone.Sort = nil
-		qq = &clone
-	}
 
 	var n uint64
-	err := engine.Walk(tx.btx, engine.ScanOptions{
-		Prefix: dataPrefix(b.name),
-		Codec:  b.codec,
-		Query:  qq,
-	}, func(engine.Match) error {
+	err := b.scanMatches(tx, countQuery(q), func(engine.Match) (bool, error) {
 		n++
-		return nil
+
+		return true, nil
 	})
 	if err != nil {
 		return 0, err
 	}
+
 	return n, nil
+}
+
+// Exists reports whether any record matches q. It stops at the first match, so
+// an existence check on an indexed field costs a seek rather than a scan of
+// everything the predicate would have matched.
+func (b *Bucket[T]) Exists(ctx context.Context, q *query.Query) (bool, error) {
+	_ = ctx
+
+	var found bool
+	err := b.db.View(func(tx *Tx) error {
+		ok, err := b.existsTx(tx, q)
+		found = ok
+
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return found, nil
+}
+
+// ExistsTx is like Exists but operates on a caller-controlled transaction.
+func (b *Bucket[T]) ExistsTx(tx *Tx, q *query.Query) (bool, error) {
+	if tx == nil {
+		return false, fmt.Errorf("bw: nil transaction")
+	}
+
+	return b.existsTx(tx, q)
+}
+
+func (b *Bucket[T]) existsTx(tx *Tx, q *query.Query) (bool, error) {
+	if err := b.checkCurrent(); err != nil {
+		return false, err
+	}
+	if tx.db != b.db {
+		return false, fmt.Errorf("bw: transaction belongs to another database")
+	}
+
+	var found bool
+	err := b.scanMatches(tx, countQuery(q), func(engine.Match) (bool, error) {
+		found = true
+
+		return false, nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return found, nil
+}
+
+// countQuery strips paging and ordering from q: Count and Exists ignore them
+// even when present, and leaving them in would let a Limit truncate the answer.
+func countQuery(q *query.Query) *query.Query {
+	if q == nil {
+		return nil
+	}
+
+	clone := *q
+	clone.Offset = nil
+	clone.Limit = nil
+	clone.Sort = nil
+
+	return &clone
 }
 
 // keyAsBytes accepts the common ways callers pass a key and produces the

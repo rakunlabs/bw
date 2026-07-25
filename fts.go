@@ -690,28 +690,26 @@ func (fi *ftsIndex) rank(ctx context.Context, btx *badger.Txn, queryStr string) 
 		docLens:  make(map[string]uint64),
 	}
 
-	// Per-doc score plus a satisfied flag per required clause / OR group.
+	// Per-doc score plus how many required clauses and OR groups it satisfied.
+	//
+	// These are counts rather than a flag per clause: a clause's match set is
+	// keyed by pk, so a document can satisfy each required clause only once,
+	// and a group is credited once via lastOr. Counting keeps docState free of
+	// pointers and slices, which matters because one is created for every
+	// document any query term touches — on a corpus whose documents share a
+	// vocabulary that is most of the corpus.
 	type docState struct {
 		score  float64
-		reqMet []bool
-		orMet  []bool
+		reqMet int32
+		orMet  int32
+		// lastOr is the 1-based index of the OR group that last credited this
+		// document, so two alternatives of the same group count once.
+		lastOr int32
 	}
-	docs := make(map[string]*docState)
-
-	ensure := func(pk string) *docState {
-		st, ok := docs[pk]
-		if !ok {
-			st = &docState{
-				reqMet: make([]bool, len(pq.required)),
-				orMet:  make([]bool, len(pq.orGroups)),
-			}
-			docs[pk] = st
-		}
-		return st
-	}
+	docs := make(map[string]docState)
 
 	// Required clauses (AND).
-	for i, c := range pq.required {
+	for _, c := range pq.required {
 		matches, cerr := ev.evalClause(c)
 		if cerr != nil {
 			return nil, cerr
@@ -721,9 +719,10 @@ func (fi *ftsIndex) rank(ctx context.Context, btx *badger.Txn, queryStr string) 
 			return nil, nil
 		}
 		for pk, score := range matches {
-			st := ensure(pk)
-			st.reqMet[i] = true
+			st := docs[pk]
+			st.reqMet++
 			st.score += score
+			docs[pk] = st
 		}
 	}
 
@@ -735,9 +734,13 @@ func (fi *ftsIndex) rank(ctx context.Context, btx *badger.Txn, queryStr string) 
 				return nil, cerr
 			}
 			for pk, score := range matches {
-				st := ensure(pk)
-				st.orMet[gi] = true
+				st := docs[pk]
+				if st.lastOr != int32(gi)+1 {
+					st.lastOr = int32(gi) + 1
+					st.orMet++
+				}
 				st.score += score
+				docs[pk] = st
 			}
 		}
 	}
@@ -760,12 +763,17 @@ func (fi *ftsIndex) rank(ctx context.Context, btx *badger.Txn, queryStr string) 
 		pk    string
 		score float64
 	}
+	var (
+		wantReq = int32(len(pq.required))
+		wantOr  = int32(len(pq.orGroups))
+	)
+
 	hits := make([]ranked, 0, len(docs))
 	for pk, st := range docs {
 		if excluded[pk] {
 			continue
 		}
-		if !allTrue(st.reqMet) || !allTrue(st.orMet) {
+		if st.reqMet != wantReq || st.orMet != wantOr {
 			continue
 		}
 		hits = append(hits, ranked{pk: pk, score: st.score})
@@ -802,15 +810,6 @@ func ctxErr(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func allTrue(bs []bool) bool {
-	for _, b := range bs {
-		if !b {
-			return false
-		}
-	}
-	return true
-}
-
 // evaluator carries the shared state for scoring one query's clauses.
 type evaluator struct {
 	fi       *ftsIndex
@@ -823,7 +822,8 @@ type evaluator struct {
 	// Reading a length is a random Badger point read, and the same document is
 	// reached once per (clause, field) it matches, so without this the read
 	// count grows with the product of query terms and FTS fields.
-	docLens map[string]uint64
+	docLens       map[string]uint64
+	docLensLoaded bool
 }
 
 // docLen returns pk's indexed length, reading it at most once per query.
@@ -839,6 +839,62 @@ func (ev *evaluator) docLen(pk []byte) (uint64, error) {
 	ev.docLens[string(pk)] = n
 
 	return n, nil
+}
+
+// bulkDocLenRatio is the share of the corpus a clause must touch before its
+// lengths are read as one sequential scan instead of a point read per
+// document. Below it the random reads are cheaper than walking keys that will
+// not be needed; above it the scan wins, and it wins by more the larger the
+// clause is.
+const bulkDocLenRatio = 4
+
+// loadDocLens reads every document length in one pass when the clause about to
+// be scored is large enough to make that cheaper than a read per document. It
+// runs at most once per query and is a pure optimisation: docLen falls back to
+// point reads for anything the scan did not cover.
+func (ev *evaluator) loadDocLens(candidates int) error {
+	if ev.docLensLoaded || uint64(candidates)*bulkDocLenRatio < ev.docCount {
+		return nil
+	}
+	ev.docLensLoaded = true
+
+	prefix := ftsDoclenPrefix(ev.fi.bucket)
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := ev.btx.NewIterator(opts)
+	defer it.Close()
+
+	var n int
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		if n++; n%ctxCheckInterval == 0 {
+			if err := ctxErr(ev.ctx); err != nil {
+				return err
+			}
+		}
+
+		item := it.Item()
+		pk := item.Key()[len(prefix):]
+		if len(pk) == 0 {
+			continue
+		}
+
+		var length uint64
+		if err := item.Value(func(val []byte) error {
+			v, read := binary.Uvarint(val)
+			if read <= 0 {
+				return fmt.Errorf("bw: fts: malformed doclen")
+			}
+			length = v
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		ev.docLens[string(pk)] = length
+	}
+
+	return nil
 }
 
 const (
@@ -893,6 +949,10 @@ func (ev *evaluator) evalTerm(term string) (map[string]float64, error) {
 		return nil, nil
 	}
 
+	if err := ev.loadDocLens(len(fieldHits)); err != nil {
+		return nil, err
+	}
+
 	out := make(map[string]float64, len(fieldHits))
 	for i, h := range fieldHits {
 		if i%ctxCheckInterval == 0 {
@@ -934,6 +994,10 @@ func (ev *evaluator) evalPrefix(prefix string) (map[string]float64, error) {
 	}
 	if len(fieldHits) == 0 {
 		return nil, nil
+	}
+
+	if err := ev.loadDocLens(len(fieldHits)); err != nil {
+		return nil, err
 	}
 
 	// As in evalTerm, IDF is applied after the fact. It is a positive constant
@@ -1079,6 +1143,12 @@ func (fi *ftsIndex) scanPostings(ctx context.Context, btx *badger.Txn, field str
 	prefix := ftsPostingTermPrefix(fi.bucket, field, term)
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = prefix
+	// Posting values are a term frequency and (optionally) positions: small
+	// enough to live inline in the LSM tree, so they are already at hand when
+	// the key is. Badger's read-ahead would spawn prefetch workers to fetch
+	// them from the value log, paying goroutine and copy costs for values that
+	// never go there.
+	opts.PrefetchValues = false
 	it := btx.NewIterator(opts)
 	defer it.Close()
 
@@ -1086,7 +1156,9 @@ func (fi *ftsIndex) scanPostings(ctx context.Context, btx *badger.Txn, field str
 		out []postingHit
 		n   int
 	)
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+	// opts.Prefix is this exact prefix, so Valid already establishes it;
+	// ValidForPrefix would compare it a second time for every posting.
+	for it.Seek(prefix); it.Valid(); it.Next() {
 		if n++; n%ctxCheckInterval == 0 {
 			if err := ctxErr(ctx); err != nil {
 				return nil, err
@@ -1141,7 +1213,7 @@ func (fi *ftsIndex) scanPostingsPrefix(ctx context.Context, btx *badger.Txn, fie
 		out []postingHit
 		n   int
 	)
-	for it.Seek(fieldPrefix); it.ValidForPrefix(fieldPrefix); it.Next() {
+	for it.Seek(fieldPrefix); it.Valid(); it.Next() {
 		if n++; n%ctxCheckInterval == 0 {
 			if err := ctxErr(ctx); err != nil {
 				return nil, err
