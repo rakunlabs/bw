@@ -1105,6 +1105,31 @@ type SearchOptions struct {
 	// materialising the whole hit set. Ranking itself is unaffected: scores are
 	// the corpus-wide BM25 scores, not scores relative to the filtered subset.
 	Filter any
+	// KeyFilter, when non-nil, rejects hits by primary key before the record
+	// is read.
+	//
+	// It is the cheap counterpart to Filter. Filter has to fetch a record and
+	// decode the fields it references before it can judge it, so a search
+	// whose matches are a small slice of a large index still pays a point read
+	// per hit. KeyFilter sees only the key the ranking already produced, so a
+	// rejected hit costs a function call.
+	//
+	// Use it when the partition a record belongs to is encoded in its key —
+	// the common shape for a multi-tenant or chunked index. Both filters may
+	// be set, in which case KeyFilter runs first and Filter decides the rest.
+	KeyFilter func(id string) bool
+	// Matched, when non-nil, receives the number of hits that passed Filter
+	// across the whole ranking, independent of Offset and Limit.
+	//
+	// It exists so a paginated filtered search can report an exact total
+	// without paying for one. The count SearchWalk returns is taken before
+	// Filter, so a caller that needs the filtered figure would otherwise have
+	// to be delivered every match and count them itself — and being delivered a
+	// record means fully decoding it, for rows outside the page that nobody
+	// asked for. With Matched set, hits beyond the page are filtered and
+	// counted but never hydrated, so the total costs the filter's field decode
+	// rather than the record's.
+	Matched *uint64
 }
 
 // Search performs a full-text search over the bucket's FTS-tagged fields.
@@ -1195,12 +1220,39 @@ func (b *Bucket[T]) SearchWalk(ctx context.Context, queryStr string, opts Search
 		var (
 			skip      = opts.Offset
 			delivered int
+			matched   uint64
+			// counting keeps the walk going after delivery has finished, so
+			// opts.Matched can report an exact figure. Hits visited in this
+			// state are filtered and counted but never hydrated.
+			counting bool
 		)
+		if opts.Matched != nil {
+			defer func() { *opts.Matched = matched }()
+		}
+
 		for i, h := range hits {
 			if i%ctxCheckInterval == 0 {
 				if err := ctxErr(ctx); err != nil {
 					return err
 				}
+			}
+
+			if opts.KeyFilter != nil && !opts.KeyFilter(h.ID) {
+				continue
+			}
+
+			// With no field filter the key has already decided membership, so
+			// a hit that is not going to be delivered — skipped by Offset, or
+			// only being counted — never has to be read at all. This is what
+			// makes an exact total over a key-partitioned index cost a pass
+			// over the ranking rather than a point read per hit.
+			if len(filter) == 0 && (counting || skip > 0) {
+				matched++
+				if !counting {
+					skip--
+				}
+
+				continue
 			}
 
 			item, getErr := tx.btx.Get(dataKey(b.name, []byte(h.ID)))
@@ -1235,8 +1287,12 @@ func (b *Bucket[T]) SearchWalk(ctx context.Context, queryStr string, opts Search
 					}
 				}
 
-				if skip > 0 {
-					skip--
+				matched++
+
+				if counting || skip > 0 {
+					if !counting {
+						skip--
+					}
 
 					return nil
 				}
@@ -1258,7 +1314,13 @@ func (b *Bucket[T]) SearchWalk(ctx context.Context, queryStr string, opts Search
 			}
 			delivered++
 			if !more || (opts.Limit > 0 && delivered >= opts.Limit) {
-				break
+				// Without a count to finish there is nothing left to do, which
+				// is the property the streaming API exists for: stopping early
+				// must not cost the rest of the hit set.
+				if opts.Matched == nil {
+					break
+				}
+				counting = true
 			}
 		}
 
