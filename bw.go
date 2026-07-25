@@ -29,6 +29,10 @@ type DB struct {
 	fts   *ftsRegistry    // full-text search indexes
 	vec   *vectorRegistry // vector search indexes
 
+	// vecCacheBytes is the per-vector-index cache budget for this
+	// database. Zero uses DefaultVectorCacheBytes.
+	vecCacheBytes int64
+
 	// Index and HNSW maintenance update shared keys. Holding this lock
 	// for the full write transaction lifetime keeps those read-modify-
 	// write operations safe even when Badger conflict detection is off.
@@ -143,12 +147,13 @@ func Open(path string, opts ...Option) (*DB, error) {
 	}
 
 	db := &DB{
-		bdb:    bdb,
-		codec:  o.codec,
-		path:   dbPath,
-		fts:    newFTSRegistry(),
-		vec:    newVectorRegistry(),
-		epochs: make(map[string]uint64),
+		bdb:           bdb,
+		codec:         o.codec,
+		path:          dbPath,
+		fts:           newFTSRegistry(),
+		vec:           newVectorRegistry(),
+		vecCacheBytes: o.vecCacheBytes,
+		epochs:        make(map[string]uint64),
 	}
 	db.accessMu.init()
 	return db, nil

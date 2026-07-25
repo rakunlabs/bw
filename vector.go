@@ -147,27 +147,50 @@ type vecEntry struct {
 
 // vecCache is a simple concurrent read-through cache of decoded vectors.
 // Vectors are immutable per pk until overwritten, so correctness only
-// requires invalidating a pk on write/delete. It is intentionally
-// unbounded-with-a-cap: embedded indexes are modest, and a hard cap with
-// random eviction avoids unbounded growth on very large graphs without
-// the overhead of true LRU bookkeeping on the hot path.
+// requires invalidating a pk on write/delete. Random eviction keeps the
+// hot path free of LRU bookkeeping; the working set of a single query is
+// small relative to the budget, so the loss in hit rate is not worth
+// paying for on every traversal step.
+//
+// The budget is in bytes, not entries. An entry count is not a bound on
+// memory when the entry size is chosen by the caller: the same 200,000
+// vectors are 75 MB at 96 dimensions and 1.2 GB at 1536, so a cache sized
+// for the first silently becomes the largest allocation in the process
+// for the second. Callers set the budget with [WithVectorCacheBytes].
 type vecCache struct {
-	mu  sync.RWMutex
-	m   map[string]vecEntry
-	cap int
+	mu     sync.RWMutex
+	m      map[string]vecEntry
+	bytes  int64
+	budget int64
 }
 
-func newVecCache(capacity int) *vecCache {
-	if capacity <= 0 {
-		capacity = defaultVecCacheCap
+func newVecCache(budget int64) *vecCache {
+	if budget <= 0 {
+		budget = DefaultVectorCacheBytes
 	}
-	return &vecCache{m: make(map[string]vecEntry, 1024), cap: capacity}
+	return &vecCache{m: make(map[string]vecEntry, 1024), budget: budget}
 }
 
-// defaultVecCacheCap bounds cached vectors. At 96 dims (~384 B/vec) this
-// is roughly 75 MB — comfortably holds the whole graph for typical
-// embedded workloads while capping worst-case memory.
-const defaultVecCacheCap = 200_000
+// DefaultVectorCacheBytes is the per-vector-index cache budget applied
+// when the caller does not set one. It is a package-level var so a
+// process can tune every index at once without touching each Open.
+//
+// 64 MiB holds roughly 130,000 vectors at 96 dimensions and 10,000 at
+// 1536 — in both cases a working set large enough for HNSW traversal to
+// stay in RAM, at a cost that does not depend on the embedding model.
+var DefaultVectorCacheBytes int64 = 64 << 20
+
+// vecEntryOverhead approximates the fixed per-entry cost that is not the
+// vector itself: the map bucket slot, the string header and backing array
+// for the key, and the vecEntry struct. Counting it keeps the budget
+// honest for small vectors, where the bookkeeping outweighs the payload
+// and an entry count would otherwise explode.
+const vecEntryOverhead = 64
+
+// entryBytes estimates what one cached entry costs.
+func entryBytes(pk string, e vecEntry) int64 {
+	return int64(len(pk)) + int64(len(e.vec))*4 + vecEntryOverhead
+}
 
 func (c *vecCache) get(pk []byte) (vecEntry, bool) {
 	c.mu.RLock()
@@ -177,29 +200,65 @@ func (c *vecCache) get(pk []byte) (vecEntry, bool) {
 }
 
 func (c *vecCache) put(pk []byte, e vecEntry) {
+	key := string(pk)
+	size := entryBytes(key, e)
+
 	c.mu.Lock()
-	if len(c.m) >= c.cap {
-		// Evict an arbitrary entry (Go map iteration order) to stay
-		// under the cap. Cheap and good enough; the working set of a
-		// single query is tiny relative to cap.
-		for k := range c.m {
+	defer c.mu.Unlock()
+
+	// A single vector wider than the whole budget would otherwise send
+	// the eviction loop below through the entire map to no effect.
+	if size > c.budget {
+		return
+	}
+
+	if old, ok := c.m[key]; ok {
+		c.bytes -= entryBytes(key, old)
+	}
+
+	c.m[key] = e
+	c.bytes += size
+
+	// Evict arbitrary entries (Go map iteration order) until back under
+	// budget. Vectors in one index share a dimension, so entries are
+	// near-uniform in size and this terminates in a bounded number of
+	// steps.
+	for c.bytes > c.budget {
+		evicted := false
+		for k, v := range c.m {
+			if k == key {
+				continue // never evict the entry just inserted
+			}
 			delete(c.m, k)
+			c.bytes -= entryBytes(k, v)
+			evicted = true
+			break
+		}
+
+		// Nothing left to evict: the new entry alone is over budget,
+		// which the size check above should already have prevented.
+		// Stop rather than spin.
+		if !evicted {
 			break
 		}
 	}
-	c.m[string(pk)] = e
-	c.mu.Unlock()
 }
 
 func (c *vecCache) invalidate(pk []byte) {
+	key := string(pk)
+
 	c.mu.Lock()
-	delete(c.m, string(pk))
+	if e, ok := c.m[key]; ok {
+		c.bytes -= entryBytes(key, e)
+		delete(c.m, key)
+	}
 	c.mu.Unlock()
 }
 
 func (c *vecCache) clear() {
 	c.mu.Lock()
 	c.m = make(map[string]vecEntry, 1024)
+	c.bytes = 0
 	c.mu.Unlock()
 }
 
@@ -292,7 +351,7 @@ func (r *vectorRegistry) closeAll() {
 // openVectorIndex returns the vector handle for a bucket. Stage A only
 // supports a single vector field per bucket — VectorFields()[0] is
 // taken. If multi-vector becomes a use case, this becomes a slice.
-func openVectorIndex(_ *DB, bucket string, fields []*schema.Field) (*vectorIndex, error) {
+func openVectorIndex(db *DB, bucket string, fields []*schema.Field) (*vectorIndex, error) {
 	if len(fields) == 0 {
 		return nil, nil
 	}
@@ -303,12 +362,17 @@ func openVectorIndex(_ *DB, bucket string, fields []*schema.Field) (*vectorIndex
 	if f.Type.Kind() != reflect.Slice || f.Type.Elem().Kind() != reflect.Float32 {
 		return nil, fmt.Errorf("bw: vector field %q must be []float32", f.Name)
 	}
+	var budget int64
+	if db != nil {
+		budget = db.vecCacheBytes
+	}
+
 	vi := &vectorIndex{
 		bucket:   bucket,
 		field:    f,
 		defaultM: parseMetricName(f.VectorMetric),
 		rng:      newVecRand(0),
-		cache:    newVecCache(defaultVecCacheCap),
+		cache:    newVecCache(budget),
 	}
 	return vi, nil
 }

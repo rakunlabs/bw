@@ -26,11 +26,12 @@ var (
 type Option func(*options)
 
 type options struct {
-	codec    codec.Codec
-	badger   *badger.Options
-	badgerFn func(*badger.Options)
-	logger   badger.Logger
-	inMem    *bool
+	codec         codec.Codec
+	badger        *badger.Options
+	badgerFn      func(*badger.Options)
+	logger        badger.Logger
+	inMem         *bool
+	vecCacheBytes int64
 }
 
 // WithCodec sets the codec used to serialize record values.
@@ -86,6 +87,21 @@ func WithLogger(l badger.Logger) Option {
 	return func(o *options) {
 		o.logger = l
 	}
+}
+
+// WithVectorCacheBytes bounds the decoded-vector cache each vector index
+// in this database may hold, in bytes. Zero or negative uses
+// [DefaultVectorCacheBytes].
+//
+// The cache serves HNSW graph traversal from RAM instead of a Badger read
+// and decode per visited node, so it is the difference between a fast and
+// a slow vector search. Its cost, however, is set by the embedding model:
+// the same number of cached vectors is 75 MB at 96 dimensions and 1.2 GB
+// at 1536. Processes with a memory limit — a container, typically —
+// should derive this from that limit rather than accept a default chosen
+// without knowledge of either.
+func WithVectorCacheBytes(n int64) Option {
+	return func(o *options) { o.vecCacheBytes = n }
 }
 
 // WithInMemory configures Badger to run entirely in memory. Convenient for
