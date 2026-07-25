@@ -646,28 +646,49 @@ func (fi *ftsIndex) readStats(btx *badger.Txn) (uint64, uint64, error) {
 // Search path
 // ---------------------------------------------------------------------------
 
-// search parses the query, evaluates its clauses (AND / OR / NOT /
-// phrase / prefix) and returns the top-N hits ordered by descending
-// BM25 score. See fts_query.go for the query grammar.
-func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) ([]SearchHit, uint64, error) {
+// ctxCheckInterval is how many inner-loop iterations run between context
+// cancellation checks. A query over a large posting list can run for a long
+// time, and a caller that has gone away (an abandoned HTTP request, a cancelled
+// job) must not keep it alive. Checking every iteration would cost more than
+// the work between checks; this bounds the abort latency to a fraction of a
+// millisecond while staying off the hot path.
+const ctxCheckInterval = 1024
+
+// rank parses the query, evaluates its clauses (AND / OR / NOT / phrase /
+// prefix) and returns every matching document ordered by descending BM25
+// score. See fts_query.go for the query grammar.
+//
+// Ranking is one whole-query pass, so paging is a slice of this list rather
+// than a re-evaluation: a caller walking N pages costs one evaluation, not N.
+func (fi *ftsIndex) rank(ctx context.Context, btx *badger.Txn, queryStr string) ([]SearchHit, error) {
 	fi.mu.RLock()
 	defer fi.mu.RUnlock()
 
 	pq := parseQuery(fi.tokenizer, queryStr)
 	if pq.isEmpty() {
-		return nil, 0, nil
+		return nil, nil
 	}
 
 	docCount, sumLen, err := fi.readStats(btx)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	if docCount == 0 {
-		return nil, 0, nil
+		return nil, nil
 	}
 	avgLen := float64(sumLen) / float64(docCount)
 
-	ev := &evaluator{fi: fi, btx: btx, docCount: docCount, avgLen: avgLen}
+	// docLens is shared by every clause: a document matched by several terms,
+	// or by one term in several fields, would otherwise pay a random Badger
+	// read for its length once per (term, field) occurrence.
+	ev := &evaluator{
+		fi:       fi,
+		btx:      btx,
+		ctx:      ctx,
+		docCount: docCount,
+		avgLen:   avgLen,
+		docLens:  make(map[string]uint64),
+	}
 
 	// Per-doc score plus a satisfied flag per required clause / OR group.
 	type docState struct {
@@ -693,11 +714,11 @@ func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) 
 	for i, c := range pq.required {
 		matches, cerr := ev.evalClause(c)
 		if cerr != nil {
-			return nil, 0, cerr
+			return nil, cerr
 		}
 		if len(matches) == 0 {
 			// A required clause with no matches means zero results.
-			return nil, 0, nil
+			return nil, nil
 		}
 		for pk, score := range matches {
 			st := ensure(pk)
@@ -711,7 +732,7 @@ func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) 
 		for _, c := range group {
 			matches, cerr := ev.evalClause(c)
 			if cerr != nil {
-				return nil, 0, cerr
+				return nil, cerr
 			}
 			for pk, score := range matches {
 				st := ensure(pk)
@@ -726,7 +747,7 @@ func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) 
 	for _, c := range pq.excluded {
 		matches, cerr := ev.evalClause(c)
 		if cerr != nil {
-			return nil, 0, cerr
+			return nil, cerr
 		}
 		for pk := range matches {
 			excluded[pk] = true
@@ -750,7 +771,11 @@ func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) 
 		hits = append(hits, ranked{pk: pk, score: st.score})
 	}
 	if len(hits) == 0 {
-		return nil, 0, nil
+		return nil, nil
+	}
+
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
 	}
 
 	sort.Slice(hits, func(i, j int) bool {
@@ -760,22 +785,21 @@ func (fi *ftsIndex) search(btx *badger.Txn, queryStr string, limit, offset int) 
 		return hits[i].pk < hits[j].pk
 	})
 
-	total := uint64(len(hits))
-	if offset > 0 {
-		if offset >= len(hits) {
-			return nil, total, nil
-		}
-		hits = hits[offset:]
-	}
-	if limit > 0 && len(hits) > limit {
-		hits = hits[:limit]
-	}
-
 	out := make([]SearchHit, 0, len(hits))
 	for _, h := range hits {
 		out = append(out, SearchHit{ID: h.pk, Score: h.score})
 	}
-	return out, total, nil
+
+	return out, nil
+}
+
+// ctxErr reports a cancelled context, tolerating a nil one.
+func ctxErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+
+	return ctx.Err()
 }
 
 func allTrue(bs []bool) bool {
@@ -791,8 +815,30 @@ func allTrue(bs []bool) bool {
 type evaluator struct {
 	fi       *ftsIndex
 	btx      *badger.Txn
+	ctx      context.Context
 	docCount uint64
 	avgLen   float64
+
+	// docLens memoises per-document lengths for the lifetime of one query.
+	// Reading a length is a random Badger point read, and the same document is
+	// reached once per (clause, field) it matches, so without this the read
+	// count grows with the product of query terms and FTS fields.
+	docLens map[string]uint64
+}
+
+// docLen returns pk's indexed length, reading it at most once per query.
+func (ev *evaluator) docLen(pk []byte) (uint64, error) {
+	if n, ok := ev.docLens[string(pk)]; ok {
+		return n, nil
+	}
+
+	n, err := ev.fi.readDocLen(ev.btx, pk)
+	if err != nil {
+		return 0, err
+	}
+	ev.docLens[string(pk)] = n
+
+	return n, nil
 }
 
 const (
@@ -826,29 +872,47 @@ func (ev *evaluator) evalClause(c queryClause) (map[string]float64, error) {
 }
 
 // evalTerm scores an exact single-term clause.
+//
+// The per-document contributions are accumulated without the IDF factor and
+// scaled by it at the end: IDF depends on the clause's document frequency,
+// which is exactly the size of the accumulator, so this yields the same score
+// as a two-pass version without building a second set to count distinct docs.
 func (ev *evaluator) evalTerm(term string) (map[string]float64, error) {
 	fieldHits := make([]postingHit, 0, 8)
 	for _, f := range ev.fi.fields {
-		hits, err := ev.fi.scanPostings(ev.btx, f.Name, []byte(term), false)
+		if err := ctxErr(ev.ctx); err != nil {
+			return nil, err
+		}
+		hits, err := ev.fi.scanPostings(ev.ctx, ev.btx, f.Name, []byte(term), false)
 		if err != nil {
 			return nil, err
 		}
 		fieldHits = append(fieldHits, hits...)
 	}
-	df := uint64(uniqueDocs(fieldHits))
-	if df == 0 {
+	if len(fieldHits) == 0 {
 		return nil, nil
 	}
-	idf := ev.idf(df)
 
 	out := make(map[string]float64, len(fieldHits))
-	for _, h := range fieldHits {
-		docLen, err := ev.fi.readDocLen(ev.btx, h.pk)
+	for i, h := range fieldHits {
+		if i%ctxCheckInterval == 0 {
+			if err := ctxErr(ev.ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		docLen, err := ev.docLen(h.pk)
 		if err != nil {
 			return nil, err
 		}
-		out[string(h.pk)] += ev.bm25(idf, h.tf, docLen)
+		out[string(h.pk)] += ev.bm25(1, h.tf, docLen)
 	}
+
+	idf := ev.idf(uint64(len(out)))
+	for pk := range out {
+		out[pk] *= idf
+	}
+
 	return out, nil
 }
 
@@ -859,29 +923,43 @@ func (ev *evaluator) evalTerm(term string) (map[string]float64, error) {
 func (ev *evaluator) evalPrefix(prefix string) (map[string]float64, error) {
 	fieldHits := make([]postingHit, 0, 16)
 	for _, f := range ev.fi.fields {
-		hits, err := ev.fi.scanPostingsPrefix(ev.btx, f.Name, []byte(prefix))
+		if err := ctxErr(ev.ctx); err != nil {
+			return nil, err
+		}
+		hits, err := ev.fi.scanPostingsPrefix(ev.ctx, ev.btx, f.Name, []byte(prefix))
 		if err != nil {
 			return nil, err
 		}
 		fieldHits = append(fieldHits, hits...)
 	}
-	df := uint64(uniqueDocs(fieldHits))
-	if df == 0 {
+	if len(fieldHits) == 0 {
 		return nil, nil
 	}
-	idf := ev.idf(df)
 
+	// As in evalTerm, IDF is applied after the fact. It is a positive constant
+	// for the clause, so scaling afterwards preserves the per-document maximum.
 	out := make(map[string]float64, len(fieldHits))
-	for _, h := range fieldHits {
-		docLen, err := ev.fi.readDocLen(ev.btx, h.pk)
+	for i, h := range fieldHits {
+		if i%ctxCheckInterval == 0 {
+			if err := ctxErr(ev.ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		docLen, err := ev.docLen(h.pk)
 		if err != nil {
 			return nil, err
 		}
-		s := ev.bm25(idf, h.tf, docLen)
-		if s > out[string(h.pk)] {
+		if s := ev.bm25(1, h.tf, docLen); s > out[string(h.pk)] {
 			out[string(h.pk)] = s
 		}
 	}
+
+	idf := ev.idf(uint64(len(out)))
+	for pk := range out {
+		out[pk] *= idf
+	}
+
 	return out, nil
 }
 
@@ -903,7 +981,10 @@ func (ev *evaluator) evalPhrase(phrase []string) (map[string]float64, error) {
 		tokenPositions := make([]map[string][]uint32, len(phrase))
 		ok := true
 		for i, tok := range phrase {
-			hits, err := ev.fi.scanPostings(ev.btx, f.Name, []byte(tok), true)
+			if err := ctxErr(ev.ctx); err != nil {
+				return nil, err
+			}
+			hits, err := ev.fi.scanPostings(ev.ctx, ev.btx, f.Name, []byte(tok), true)
 			if err != nil {
 				return nil, err
 			}
@@ -927,7 +1008,7 @@ func (ev *evaluator) evalPhrase(phrase []string) (map[string]float64, error) {
 				// Score with a phrase bonus: treat the whole phrase as
 				// one occurrence weighted by its length so multi-word
 				// phrases rank above incidental single-term hits.
-				docLen, err := ev.fi.readDocLen(ev.btx, []byte(pk))
+				docLen, err := ev.docLen([]byte(pk))
 				if err != nil {
 					return nil, err
 				}
@@ -989,13 +1070,12 @@ type postingHit struct {
 	pk        []byte
 	tf        uint64
 	positions []uint32 // populated only when wantPositions was requested
-	firstSeen bool     // true on the first occurrence of pk across all fields for the current term
 }
 
 // scanPostings returns every (pk, tf) pair from the posting list for
 // (bucket, field, term). Positions are decoded only when wantPositions
 // is true (phrase queries), keeping the common ranking path cheap.
-func (fi *ftsIndex) scanPostings(btx *badger.Txn, field string, term []byte, wantPositions bool) ([]postingHit, error) {
+func (fi *ftsIndex) scanPostings(ctx context.Context, btx *badger.Txn, field string, term []byte, wantPositions bool) ([]postingHit, error) {
 	prefix := ftsPostingTermPrefix(fi.bucket, field, term)
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = prefix
@@ -1003,10 +1083,15 @@ func (fi *ftsIndex) scanPostings(btx *badger.Txn, field string, term []byte, wan
 	defer it.Close()
 
 	var (
-		out  []postingHit
-		seen = make(map[string]bool)
+		out []postingHit
+		n   int
 	)
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		if n++; n%ctxCheckInterval == 0 {
+			if err := ctxErr(ctx); err != nil {
+				return nil, err
+			}
+		}
 		item := it.Item()
 		key := item.KeyCopy(nil)
 		pk := pkFromPostingKey(key, prefix)
@@ -1031,18 +1116,16 @@ func (fi *ftsIndex) scanPostings(btx *badger.Txn, field string, term []byte, wan
 		if err != nil {
 			return nil, err
 		}
-		first := !seen[string(pk)]
-		seen[string(pk)] = true
-		out = append(out, postingHit{pk: pk, tf: tf, positions: pos, firstSeen: first})
+		out = append(out, postingHit{pk: pk, tf: tf, positions: pos})
 	}
 	return out, nil
 }
 
 // scanPostingsPrefix returns posting hits for every term in (bucket,
 // field) that begins with termPrefix. Multiple matching terms may
-// contribute the same pk; callers dedupe via uniqueDocs. This backs
-// wildcard queries like "test*".
-func (fi *ftsIndex) scanPostingsPrefix(btx *badger.Txn, field string, termPrefix []byte) ([]postingHit, error) {
+// contribute the same pk; the caller's per-document accumulator dedupes
+// them. This backs wildcard queries like "test*".
+func (fi *ftsIndex) scanPostingsPrefix(ctx context.Context, btx *badger.Txn, field string, termPrefix []byte) ([]postingHit, error) {
 	// The posting key is fieldPrefix + lp(term) + pk. A bare term
 	// prefix is not length-prefix-aligned, so we scan the whole field
 	// keyspace and filter by decoding each key's term. Field posting
@@ -1055,10 +1138,15 @@ func (fi *ftsIndex) scanPostingsPrefix(btx *badger.Txn, field string, termPrefix
 	defer it.Close()
 
 	var (
-		out  []postingHit
-		seen = make(map[string]bool)
+		out []postingHit
+		n   int
 	)
 	for it.Seek(fieldPrefix); it.ValidForPrefix(fieldPrefix); it.Next() {
+		if n++; n%ctxCheckInterval == 0 {
+			if err := ctxErr(ctx); err != nil {
+				return nil, err
+			}
+		}
 		key := it.Item().KeyCopy(nil)
 		term, pk := termAndPKFromPostingKey(key, fieldPrefix)
 		if term == nil || pk == nil {
@@ -1067,30 +1155,16 @@ func (fi *ftsIndex) scanPostingsPrefix(btx *badger.Txn, field string, termPrefix
 		if !bytesHasPrefix(term, termPrefix) {
 			continue
 		}
-		first := !seen[string(pk)]
-		seen[string(pk)] = true
 		// tf=1 as a floor; prefix matches contribute presence, not
 		// precise term frequency. Ranking still works via IDF/among
 		// docs. (Exact tf would require a value read per key.)
-		out = append(out, postingHit{pk: pk, tf: 1, firstSeen: first})
+		out = append(out, postingHit{pk: pk, tf: 1})
 	}
 	return out, nil
 }
 
 func bytesHasPrefix(b, prefix []byte) bool {
 	return len(b) >= len(prefix) && string(b[:len(prefix)]) == string(prefix)
-}
-
-// uniqueDocs counts distinct pks in a posting-hit slice.
-func uniqueDocs(hits []postingHit) int {
-	if len(hits) == 0 {
-		return 0
-	}
-	seen := make(map[string]bool, len(hits))
-	for _, h := range hits {
-		seen[string(h.pk)] = true
-	}
-	return len(seen)
 }
 
 // readDocLen returns the per-doc length for pk, or 0 if missing.

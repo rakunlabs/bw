@@ -992,64 +992,207 @@ type SearchResult[T any] struct {
 	Score  float64
 }
 
-// Search performs a full-text search over the bucket's FTS-tagged fields
-// using Bleve's query string syntax. It returns matched records hydrated
-// from BadgerDB, ordered by relevance score (highest first).
+// searchPrealloc caps how many result slots Search reserves up front.
+const searchPrealloc = 1024
+
+// SearchOptions configures Bucket.SearchWith.
+type SearchOptions struct {
+	// Limit caps the number of returned records (0 means the default 10).
+	Limit int
+	// Offset skips this many results that would otherwise be returned. When a
+	// Filter is set it counts records that passed the filter, so paging stays
+	// consistent with what the caller sees.
+	Offset int
+	// Filter, when non-nil, must be a *query.Query. Only records matching it
+	// are returned.
+	//
+	// It is applied to the ranked hits in score order, and only the fields the
+	// filter references are decoded, so a query whose matches are dominated by
+	// one partition costs a bounded number of point reads instead of
+	// materialising the whole hit set. Ranking itself is unaffected: scores are
+	// the corpus-wide BM25 scores, not scores relative to the filtered subset.
+	Filter any
+}
+
+// Search performs a full-text search over the bucket's FTS-tagged fields.
+// It returns matched records hydrated from BadgerDB, ordered by relevance
+// score (highest first), along with the total number of matching documents.
 //
 // Returns ErrNoFTS if the bucket has no FTS-tagged fields.
 // limit and offset control pagination (0 limit means default 10).
 func (b *Bucket[T]) Search(ctx context.Context, query string, limit, offset int) ([]SearchResult[T], uint64, error) {
-	_ = ctx
-	if err := b.checkCurrent(); err != nil {
-		return nil, 0, err
-	}
+	return b.SearchWith(ctx, query, SearchOptions{Limit: limit, Offset: offset})
+}
 
-	if b.ftsIdx == nil {
-		return nil, 0, ErrNoFTS
-	}
-
+// SearchWith is Search with an optional structured filter; see SearchOptions.
+//
+// The returned total is the number of documents matching the full-text query,
+// before opts.Filter is applied: counting the filtered set exactly would mean
+// reading every hit, which is the cost the filter exists to avoid.
+func (b *Bucket[T]) SearchWith(ctx context.Context, queryStr string, opts SearchOptions) ([]SearchResult[T], uint64, error) {
+	limit := opts.Limit
 	if limit <= 0 {
 		limit = 10
 	}
+	opts.Limit = limit
 
-	var (
-		results []SearchResult[T]
-		total   uint64
-	)
-	err := b.db.View(func(tx *Tx) error {
-		if err := b.checkCurrent(); err != nil {
-			return err
-		}
-		hits, hitCount, err := b.ftsIdx.search(tx.btx, query, limit, offset)
-		if err != nil {
-			return fmt.Errorf("bw: search: %w", err)
-		}
-		total = hitCount
-		results = make([]SearchResult[T], 0, len(hits))
-		for _, h := range hits {
-			pk := []byte(h.ID)
-			item, getErr := tx.btx.Get(dataKey(b.name, pk))
-			if getErr != nil {
-				if errors.Is(getErr, badger.ErrKeyNotFound) {
-					continue
-				}
-				return getErr
-			}
-			rec := new(T)
-			if err := item.Value(func(val []byte) error {
-				return b.codec.Unmarshal(val, rec)
-			}); err != nil {
-				return err
-			}
-			results = append(results, SearchResult[T]{Record: rec, Score: h.Score})
-		}
-		return nil
+	// Callers legitimately pass a huge limit to mean "everything"; the result
+	// slice grows on demand instead of trusting that as a capacity.
+	results := make([]SearchResult[T], 0, min(limit, searchPrealloc))
+	total, err := b.SearchWalk(ctx, queryStr, opts, func(hit SearchResult[T]) (bool, error) {
+		results = append(results, hit)
+
+		return true, nil
 	})
 	if err != nil {
 		return nil, 0, err
 	}
 
 	return results, total, nil
+}
+
+// SearchWalk streams ranked search results to fn, highest score first, and
+// returns the number of documents matching the full-text query (before
+// opts.Filter, as for SearchWith).
+//
+// fn reports whether to continue. This is the primitive behind Search: because
+// records are hydrated lazily, in rank order, a caller that stops early — after
+// collecting N distinct documents from a chunked index, say — pays for the hits
+// it actually consumed rather than for the whole result set. opts.Limit of 0
+// means "no limit" here, unlike Search's default of 10.
+func (b *Bucket[T]) SearchWalk(ctx context.Context, queryStr string, opts SearchOptions, fn func(SearchResult[T]) (bool, error)) (uint64, error) {
+	if err := b.checkCurrent(); err != nil {
+		return 0, err
+	}
+
+	if b.ftsIdx == nil {
+		return 0, ErrNoFTS
+	}
+
+	filter, err := searchFilterWhere(opts.Filter)
+	if err != nil {
+		return 0, err
+	}
+
+	var total uint64
+	err = b.db.View(func(tx *Tx) error {
+		if err := b.checkCurrent(); err != nil {
+			return err
+		}
+		hits, err := b.ftsIdx.rank(ctx, tx.btx, queryStr)
+		if err != nil {
+			return fmt.Errorf("bw: search: %w", err)
+		}
+		total = uint64(len(hits))
+
+		// Decoding for the filter pulls only the referenced fields when the
+		// codec supports it, so filtering a hit is far cheaper than hydrating
+		// the record it guards.
+		var (
+			lazy       codec.LazyCodec
+			lazyFields []string
+		)
+		if len(filter) > 0 {
+			if lc, ok := b.codec.(codec.LazyCodec); ok {
+				lazy = lc
+				lazyFields = engine.CollectFields(filter)
+			}
+		}
+
+		var (
+			skip      = opts.Offset
+			delivered int
+		)
+		for i, h := range hits {
+			if i%ctxCheckInterval == 0 {
+				if err := ctxErr(ctx); err != nil {
+					return err
+				}
+			}
+
+			item, getErr := tx.btx.Get(dataKey(b.name, []byte(h.ID)))
+			if getErr != nil {
+				if errors.Is(getErr, badger.ErrKeyNotFound) {
+					continue
+				}
+				return getErr
+			}
+
+			var rec *T
+			if err := item.Value(func(val []byte) error {
+				if len(filter) > 0 {
+					var (
+						decoded map[string]any
+						derr    error
+					)
+					if lazy != nil {
+						decoded, derr = lazy.UnmarshalFields(val, lazyFields)
+					} else {
+						decoded, derr = b.codec.UnmarshalMap(val)
+					}
+					if derr != nil {
+						return derr
+					}
+					ok, eerr := engine.Eval(decoded, filter)
+					if eerr != nil {
+						return eerr
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				if skip > 0 {
+					skip--
+
+					return nil
+				}
+
+				rec = new(T)
+
+				return b.codec.Unmarshal(val, rec)
+			}); err != nil {
+				return err
+			}
+
+			if rec == nil {
+				continue
+			}
+
+			more, cbErr := fn(SearchResult[T]{Record: rec, Score: h.Score})
+			if cbErr != nil {
+				return cbErr
+			}
+			delivered++
+			if !more || (opts.Limit > 0 && delivered >= opts.Limit) {
+				break
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return total, nil
+}
+
+// searchFilterWhere validates and unwraps a SearchOptions.Filter.
+func searchFilterWhere(filter any) ([]query.Expression, error) {
+	if filter == nil {
+		return nil, nil
+	}
+
+	q, ok := filter.(*query.Query)
+	if !ok {
+		return nil, fmt.Errorf("bw: search filter must be *query.Query, got %T", filter)
+	}
+	if q == nil {
+		return nil, nil
+	}
+
+	return q.Where, nil
 }
 
 // SearchVector returns the top-K records whose vector field is closest
