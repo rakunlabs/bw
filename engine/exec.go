@@ -158,6 +158,114 @@ func IndexScan(txn *badger.Txn, opts IndexScanOptions) ([]Match, error) {
 	return collected, nil
 }
 
+// IndexScanKeys returns the primary keys an index plan matches without
+// fetching or decoding the referenced records.
+//
+// An index entry already embeds the primary key it points at, so a caller
+// that only needs the key set never has to touch the data keyspace. That
+// matters most on buckets whose records carry an embedding: resolving a
+// filter through IndexScan costs one Badger Get plus one full record decode
+// per match, and on a vector bucket the bulk of every decoded record is a
+// copy of a vector the caller is about to discard.
+//
+// It is only valid for an index plan with no residual predicate, since a
+// residual can only be evaluated against the record itself. Callers must
+// check Plan.ResidualWhere (and any Sort/Offset/Limit they care about)
+// before calling; an ineligible plan is reported as an error rather than
+// silently answered with an over-broad key set.
+func IndexScanKeys(txn *badger.Txn, opts IndexScanOptions) ([][]byte, error) {
+	if len(opts.Plan.ResidualWhere) > 0 {
+		return nil, errors.New("engine: IndexScanKeys needs a plan without a residual filter")
+	}
+
+	var out [][]byte
+	collect := func(pk []byte) {
+		out = append(out, append([]byte(nil), pk...))
+	}
+
+	switch opts.Plan.Kind {
+	case PlanIndexEq:
+		for _, val := range opts.Plan.IndexValues {
+			pfx := append(append([]byte{}, opts.IndexFieldPrefix...), encodeLP(val)...)
+			if err := iterIndexKeysPrefix(txn, pfx, opts.IndexFieldPrefix, collect); err != nil {
+				return nil, err
+			}
+		}
+
+		return out, nil
+	case PlanIndexRange:
+		if err := iterIndexKeysRange(txn, opts, collect); err != nil {
+			return nil, err
+		}
+
+		return out, nil
+	default:
+		return nil, errors.New("engine: IndexScanKeys called with non-index plan")
+	}
+}
+
+// keysOnlyIterOpts iterates index entries without prefetching their values.
+// Index entries carry everything in the key; the value is an empty marker.
+func keysOnlyIterOpts(prefix []byte) badger.IteratorOptions {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	opts.Prefix = prefix
+
+	return opts
+}
+
+func iterIndexKeysPrefix(txn *badger.Txn, prefix, fieldPrefix []byte, collect func([]byte)) error {
+	it := txn.NewIterator(keysOnlyIterOpts(prefix))
+	defer it.Close()
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		pk := pkSliceFromIndexKey(it.Item().Key(), fieldPrefix)
+		if pk == nil {
+			continue
+		}
+		collect(pk)
+	}
+
+	return nil
+}
+
+func iterIndexKeysRange(txn *badger.Txn, opts IndexScanOptions, collect func([]byte)) error {
+	it := txn.NewIterator(keysOnlyIterOpts(opts.IndexFieldPrefix))
+	defer it.Close()
+
+	startKey := append([]byte{}, opts.IndexFieldPrefix...)
+	if !opts.Plan.LoOpen && len(opts.Plan.Lo) > 0 {
+		startKey = append(startKey, encodeLP(opts.Plan.Lo)...)
+	}
+
+	for it.Seek(startKey); it.ValidForPrefix(opts.IndexFieldPrefix); it.Next() {
+		key := it.Item().Key()
+		rest := key[len(opts.IndexFieldPrefix):]
+		valLen, n := uvarintRead(rest)
+		if n <= 0 || uint64(len(rest)-n) < valLen {
+			continue
+		}
+		entryVal := rest[n : n+int(valLen)]
+
+		if !opts.Plan.LoOpen && len(opts.Plan.Lo) > 0 {
+			c := bytes.Compare(entryVal, opts.Plan.Lo)
+			if c < 0 || (c == 0 && !opts.Plan.LoInclusive) {
+				continue
+			}
+		}
+		if !opts.Plan.HiOpen && len(opts.Plan.Hi) > 0 {
+			c := bytes.Compare(entryVal, opts.Plan.Hi)
+			if c > 0 || (c == 0 && !opts.Plan.HiInclusive) {
+				return nil
+			}
+		}
+
+		collect(rest[n+int(valLen):])
+	}
+
+	return nil
+}
+
 // IndexWalk streams matching records from an index plan to fn. Sort is
 // ignored; Offset/Limit are honoured.
 func IndexWalk(txn *badger.Txn, opts IndexScanOptions, fn func(Match) error) error {

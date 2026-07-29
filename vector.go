@@ -137,6 +137,52 @@ type vectorIndex struct {
 	// on any write/delete of that pk, so the cache never serves stale
 	// geometry. nil until first use.
 	cache *vecCache
+
+	// rawPfx and neighPfx are the two key prefixes the traversal builds a
+	// key from on every visited node. They depend only on (bucket, field),
+	// so they are built once here instead of being reassembled — three
+	// allocations for a raw-vector key, two for a neighbour key — inside
+	// the search loop.
+	rawPfx   []byte
+	neighPfx []byte
+
+	// noInline drops the embedding from the record's encoded value, as
+	// requested by vector(inline=false). See schema.Field.VectorNoInline.
+	noInline bool
+}
+
+// clearVector zeroes the vector field on record, which must be a pointer to
+// the bucket's record type.
+func (vi *vectorIndex) clearVector(record any) {
+	rv := reflect.ValueOf(record)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return
+		}
+		rv = rv.Elem()
+	}
+
+	fv := rv.FieldByIndex(vi.field.Index)
+	if fv.CanSet() {
+		fv.SetZero()
+	}
+}
+
+// appendRawKey writes the raw-vector key for pk into dst[:0] and returns it.
+// The caller owns dst and can reuse it across iterations.
+func (vi *vectorIndex) appendRawKey(dst []byte, pk []byte) []byte {
+	dst = append(dst[:0], vi.rawPfx...)
+
+	return append(dst, pk...)
+}
+
+// appendNeighKey writes the neighbour-list key for (pk, level) into dst[:0]
+// and returns it.
+func (vi *vectorIndex) appendNeighKey(dst []byte, level uint8, pk []byte) []byte {
+	dst = append(dst[:0], vi.neighPfx...)
+	dst = append(dst, level)
+
+	return append(dst, pk...)
 }
 
 // vecEntry is one cached vector plus its tombstone (liveness) flag.
@@ -367,12 +413,18 @@ func openVectorIndex(db *DB, bucket string, fields []*schema.Field) (*vectorInde
 		budget = db.vecCacheBytes
 	}
 
+	neighPfx := vecFieldPrefix(bucket, f.Name)
+	neighPfx = append(neighPfx, vecNeighMark...)
+
 	vi := &vectorIndex{
 		bucket:   bucket,
 		field:    f,
 		defaultM: parseMetricName(f.VectorMetric),
 		rng:      newVecRand(0),
 		cache:    newVecCache(budget),
+		rawPfx:   vecRawPrefix(bucket, f.Name),
+		neighPfx: neighPfx,
+		noInline: f.VectorNoInline,
 	}
 	return vi, nil
 }
@@ -647,8 +699,17 @@ func (vi *vectorIndex) writeLevel(btx *badger.Txn, pk []byte, level uint8) error
 
 // readNeighbours returns the neighbour pks of pk at the given level.
 // Layout in value: varint(count), then count repetitions of lp(neighbourPk).
-func (vi *vectorIndex) readNeighbours(btx *badger.Txn, pk []byte, level uint8) ([][]byte, error) {
-	item, err := btx.Get(vecNeighKey(vi.bucket, vi.field.Name, level, pk))
+//
+// scratch, when non-nil, supplies the key buffer so the caller can reuse one
+// allocation across a whole traversal instead of building a key per node.
+//
+// The returned pks point into a single copy of the stored value rather than
+// each being its own allocation. Badger only lends the value bytes for the
+// duration of item.Value, so one copy is unavoidable, but M separate copies
+// per expanded node are not — and at HNSW's default degree that difference is
+// most of the allocation traffic of a search.
+func (vi *vectorIndex) readNeighbours(btx *badger.Txn, scratch []byte, pk []byte, level uint8) ([][]byte, error) {
+	item, err := btx.Get(vi.appendNeighKey(scratch, level, pk))
 	if errors.Is(err, badger.ErrKeyNotFound) {
 		return nil, nil
 	}
@@ -667,14 +728,19 @@ func (vi *vectorIndex) readNeighbours(btx *badger.Txn, pk []byte, level uint8) (
 		if count > uint64(len(rest)) {
 			return fmt.Errorf("bw: vector neigh count %d exceeds encoded value", count)
 		}
+
+		// One copy of the payload, then sub-slices into it.
+		buf := make([]byte, len(rest))
+		copy(buf, rest)
+
 		out = make([][]byte, 0, count)
 		for i := uint64(0); i < count; i++ {
-			l, m := binary.Uvarint(rest)
-			if m <= 0 || uint64(len(rest)-m) < l {
+			l, m := binary.Uvarint(buf)
+			if m <= 0 || uint64(len(buf)-m) < l {
 				return fmt.Errorf("bw: vector neigh pk decode")
 			}
-			out = append(out, append([]byte(nil), rest[m:m+int(l)]...))
-			rest = rest[m+int(l):]
+			out = append(out, buf[m:m+int(l)])
+			buf = buf[m+int(l):]
 		}
 		return nil
 	})
@@ -727,7 +793,7 @@ func (vi *vectorIndex) readVecEntry(btx *badger.Txn, pk []byte) (vecEntry, error
 		}
 	}
 
-	item, err := btx.Get(vecRawKey(vi.bucket, vi.field.Name, pk))
+	item, err := btx.Get(vi.appendRawKey(nil, pk))
 	if err != nil {
 		return vecEntry{}, err
 	}
@@ -822,7 +888,7 @@ func decodeVectorFast(b []byte) []float32 {
 // (auto-locking it on the first write). Re-inserting the same pk
 // removes the old node from the graph first so neighbour lists are
 // not left pointing at stale geometry.
-func (vi *vectorIndex) writeVec(btx *badger.Txn, pk []byte, v []float32) error {
+func (vi *vectorIndex) writeVec(ctx context.Context, btx *badger.Txn, pk []byte, v []float32) error {
 	if len(v) == 0 {
 		return ErrVectorEmpty
 	}
@@ -888,7 +954,7 @@ func (vi *vectorIndex) writeVec(btx *badger.Txn, pk []byte, v []float32) error {
 	}
 
 	// Insert into HNSW graph.
-	newMan, err := vi.insertGraph(btx, pk, v, man)
+	newMan, err := vi.insertGraph(ctx, btx, pk, v, man)
 	if err != nil {
 		return err
 	}
@@ -948,13 +1014,13 @@ func (vi *vectorIndex) removeFromGraph(btx *badger.Txn, pk []byte, man *vectorMa
 	}
 	for L := 0; L <= int(level); L++ {
 		graphLevel := uint8(L)
-		neighs, err := vi.readNeighbours(btx, pk, graphLevel)
+		neighs, err := vi.readNeighbours(btx, nil, pk, graphLevel)
 		if err != nil {
 			return err
 		}
 		// Drop the back-edge from each neighbour pointing at us.
 		for _, np := range neighs {
-			rev, err := vi.readNeighbours(btx, np, graphLevel)
+			rev, err := vi.readNeighbours(btx, nil, np, graphLevel)
 			if err != nil {
 				return err
 			}
@@ -1103,6 +1169,108 @@ func scoreChecked(metric VectorMetric, a, b []float32) (float64, error) {
 	return score(metric, a, b), nil
 }
 
+// queryScorer scores many candidates against one fixed query vector.
+//
+// It exists for cosine. The plain kernel recomputes the query's own norm for
+// every candidate it scores, which is a third of the multiply-adds and one of
+// the two square roots — wasted on a value that cannot change during a
+// search. Hoisting it out matters most at the widths real embedding models
+// produce, where the distance kernel is the search's inner cost.
+//
+// The candidate-side accumulation is deliberately left exactly as the plain
+// kernel writes it, in the same order and the same float32 accumulators, so
+// scores are bit-identical to score() rather than merely close. Ranking must
+// not shift because of an optimisation.
+type queryScorer struct {
+	metric VectorMetric
+	q      []float32
+	qNorm  float64
+}
+
+func newQueryScorer(metric VectorMetric, q []float32) queryScorer {
+	s := queryScorer{metric: metric, q: q}
+	if metric != DotProduct && metric != Euclidean {
+		var na float32
+		for _, x := range q {
+			na += x * x
+		}
+		s.qNorm = math.Sqrt(float64(na))
+	}
+
+	return s
+}
+
+func (s queryScorer) score(v []float32) (float64, error) {
+	if len(s.q) != len(v) {
+		return 0, fmt.Errorf("%w: score dimensions %d and %d", ErrDimMismatch, len(s.q), len(v))
+	}
+
+	switch s.metric {
+	case DotProduct:
+		return dot(s.q, v), nil
+	case Euclidean:
+		return -l2(s.q, v), nil
+	}
+
+	dotV, nb := dotAndNorm(s.q, v)
+
+	denom := s.qNorm * math.Sqrt(float64(nb))
+	if denom == 0 {
+		return 0, nil
+	}
+
+	return float64(dotV) / denom, nil
+}
+
+// dotAndNorm returns the dot product of a and b together with b's squared
+// norm, in one pass over both slices.
+//
+// It is unrolled by 2, giving four accumulators. A single accumulator per
+// output serialises on float32 add latency, which is what makes the plain
+// cosine kernel measure ~2.4x slower than dot over identical data. Unrolling
+// further does not help: at eight accumulators plus eight loaded values the
+// working set exceeds the XMM register file and the spills cost back the
+// whole gain (measured at 3072 dimensions: 2021 ns plain, 1031 ns at four
+// accumulators, 1982 ns at eight).
+//
+// Reslicing b to a's length lets the compiler drop b's bounds check in the
+// body, and makes the length assumption explicit rather than implied by the
+// caller's dimension check.
+//
+// Summation order differs from the plain kernel, so results differ in the
+// last bits (measured worst case 1.15e-07 relative). What that is allowed to
+// affect is pinned by TestQueryScorerRankingMatchesReference: nothing
+// observable in the ranking.
+func dotAndNorm(a, b []float32) (float32, float32) {
+	b = b[:len(a)]
+
+	var d0, d1, n0, n1 float32
+
+	i := 0
+	n := len(a)
+	for ; i <= n-2; i += 2 {
+		x0, y0 := a[i], b[i]
+		x1, y1 := a[i+1], b[i+1]
+
+		d0 += x0 * y0
+		d1 += x1 * y1
+
+		n0 += y0 * y0
+		n1 += y1 * y1
+	}
+
+	dotV := d0 + d1
+	nb := n0 + n1
+
+	for ; i < n; i++ {
+		x, y := a[i], b[i]
+		dotV += x * y
+		nb += y * y
+	}
+
+	return dotV, nb
+}
+
 func validateVector(v []float32) error {
 	for i, value := range v {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
@@ -1213,12 +1381,17 @@ func (vi *vectorIndex) greedySearchLevel(btx *badger.Txn, entry []byte, q []floa
 	if err != nil {
 		return nil, 0, err
 	}
-	currScore, err := scoreChecked(metric, q, currEnt.vec)
+	sc := newQueryScorer(metric, q)
+
+	currScore, err := sc.score(currEnt.vec)
 	if err != nil {
 		return nil, 0, err
 	}
+
+	keyBuf := make([]byte, 0, len(vi.neighPfx)+1+32)
+
 	for {
-		neighs, err := vi.readNeighbours(btx, curr, level)
+		neighs, err := vi.readNeighbours(btx, keyBuf, curr, level)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1232,7 +1405,7 @@ func (vi *vectorIndex) greedySearchLevel(btx *badger.Txn, entry []byte, q []floa
 				}
 				return nil, 0, err
 			}
-			s, err := scoreChecked(metric, q, ent.vec)
+			s, err := sc.score(ent.vec)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -1264,6 +1437,7 @@ func (vi *vectorIndex) greedySearchLevel(btx *badger.Txn, entry []byte, q []floa
 //
 // Returns the result heap as a slice of candDist, descending by score.
 func (vi *vectorIndex) efSearchLevel(
+	ctx context.Context,
 	btx *badger.Txn,
 	entries []candDist,
 	q []float32,
@@ -1275,6 +1449,8 @@ func (vi *vectorIndex) efSearchLevel(
 	visited := make(map[string]struct{}, ef*2)
 	candidates := newScoreHeap(true) // max-heap on score
 	results := newScoreHeap(false)   // min-heap on score, capped at ef
+
+	sc := newQueryScorer(metric, q)
 
 	for _, e := range entries {
 		visited[string(e.pk)] = struct{}{}
@@ -1299,14 +1475,24 @@ func (vi *vectorIndex) efSearchLevel(
 	results.cap = ef
 	results.trim()
 
+	keyBuf := make([]byte, 0, len(vi.neighPfx)+1+32)
+
+	expanded := 0
 	for candidates.len() > 0 {
+		if expanded%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		expanded++
+
 		c := candidates.popMax()
 		// If the best frontier candidate is worse than the worst
 		// result already in our top-ef, we're done.
 		if results.len() >= ef && c.score < results.peekMin().score {
 			break
 		}
-		neighs, err := vi.readNeighbours(btx, c.pk, level)
+		neighs, err := vi.readNeighbours(btx, keyBuf, c.pk, level)
 		if err != nil {
 			return nil, err
 		}
@@ -1322,7 +1508,7 @@ func (vi *vectorIndex) efSearchLevel(
 				}
 				return nil, err
 			}
-			s, err := scoreChecked(metric, q, ent.vec)
+			s, err := sc.score(ent.vec)
 			if err != nil {
 				return nil, err
 			}
@@ -1426,7 +1612,7 @@ func (vi *vectorIndex) selectNeighborsHeuristic(
 
 // insertGraph wires pk (with vector v) into the HNSW graph. Returns the
 // updated manifest (entry-point and max-level may change).
-func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man vectorManifest) (vectorManifest, error) {
+func (vi *vectorIndex) insertGraph(ctx context.Context, btx *badger.Txn, pk []byte, v []float32, man vectorManifest) (vectorManifest, error) {
 	M := vi.effectiveM(man)
 	efC := vi.effectiveEfConstruction(man)
 	metric := VectorMetric(man.Metric)
@@ -1510,7 +1696,7 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 	}
 	for L := startL; L >= 0; L-- {
 		ent := []candDist{{pk: curr, score: currScore}}
-		results, err := vi.efSearchLevel(btx, ent, v, metric, uint8(L), efC, nil)
+		results, err := vi.efSearchLevel(ctx, btx, ent, v, metric, uint8(L), efC, nil)
 		if err != nil {
 			return man, err
 		}
@@ -1535,7 +1721,7 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 
 		// Bidirectional bond + pruning of each neighbour.
 		for _, n := range neighbours {
-			rev, err := vi.readNeighbours(btx, n.pk, uint8(L))
+			rev, err := vi.readNeighbours(btx, nil, n.pk, uint8(L))
 			if err != nil {
 				return man, err
 			}
@@ -1587,7 +1773,7 @@ func (vi *vectorIndex) insertGraph(btx *badger.Txn, pk []byte, v []float32, man 
 					if _, ok := keptSet[string(rp)]; ok {
 						continue
 					}
-					reciprocal, err := vi.readNeighbours(btx, rp, uint8(L))
+					reciprocal, err := vi.readNeighbours(btx, nil, rp, uint8(L))
 					if err != nil {
 						return man, err
 					}
@@ -1757,6 +1943,7 @@ func (h *scoreHeap) drainSorted(desc bool) []candDist {
 // fall back to brute force, which is both faster and trivially exact
 // at small N. For the rest, the HNSW algorithm runs.
 func (vi *vectorIndex) search(
+	ctx context.Context,
 	btx *badger.Txn,
 	q []float32,
 	k int,
@@ -1809,18 +1996,16 @@ func (vi *vectorIndex) search(
 			return nil
 		}
 
-		// Brute-force fallback: graphs below this size, or
-		// filters with very few survivors, are faster (and
-		// trivially exact) without HNSW.
-		const bruteThreshold = 64
-		filterIsTight := allowed != nil && len(allowed) <= bruteThreshold
+		// Brute-force fallback: graphs below this size, or filters
+		// selective enough that scanning their survivors beats walking
+		// the graph, are answered exactly instead.
 		graphMetric := VectorMetric(man.Metric)
 		if graphMetric == MetricDefault {
 			graphMetric = vi.defaultM
 		}
 		metricOverride := metric != graphMetric
-		if int(man.Count) <= bruteThreshold || filterIsTight || metricOverride {
-			h, err := vi.bruteSearch(btx, q, k, metric, allowed)
+		if int(man.Count) <= bruteThreshold || bruteBeatsGraph(allowed, man.Count) || metricOverride {
+			h, err := vi.bruteSearch(ctx, btx, q, k, metric, allowed)
 			if err != nil {
 				return err
 			}
@@ -1843,7 +2028,7 @@ func (vi *vectorIndex) search(
 		curr := ep
 		currVec, err := vi.readVec(btx, curr)
 		if errors.Is(err, badger.ErrKeyNotFound) {
-			h, bruteErr := vi.bruteSearch(btx, q, k, metric, allowed)
+			h, bruteErr := vi.bruteSearch(ctx, btx, q, k, metric, allowed)
 			if bruteErr != nil {
 				return bruteErr
 			}
@@ -1868,7 +2053,7 @@ func (vi *vectorIndex) search(
 			currScore = ns
 		}
 		ent := []candDist{{pk: curr, score: currScore}}
-		results, err := vi.efSearchLevel(btx, ent, q, metric, 0, efSearch, allowed)
+		results, err := vi.efSearchLevel(ctx, btx, ent, q, metric, 0, efSearch, allowed)
 		if err != nil {
 			return err
 		}
@@ -1900,18 +2085,148 @@ func (vi *vectorIndex) search(
 	return nil
 }
 
-// bruteSearch is the small-N / tight-filter fast path: stream every
-// (non-tombstoned, allowed) raw vector and run the same top-k heap as
-// before. Always exact.
+// bruteThreshold is the graph size below which walking the HNSW graph
+// cannot pay for itself, and the floor under the filter-selectivity rule
+// in bruteBeatsGraph.
+const bruteThreshold = 64
+
+// bruteSelectivityDivisor decides when an allow-set is selective enough
+// that scanning it beats searching the graph.
+//
+// The graph pays roughly efSearch visits regardless of the filter, and each
+// visit that lands outside the allow-set is wasted: the filter is applied
+// after a node has already been fetched and scored. Worse, rejected nodes
+// never enter the result heap, so the early-termination test stays false and
+// the search keeps expanding — a selective filter makes the graph walk
+// *longer*, not shorter, while also degrading recall.
+//
+// Scanning the allow-set costs one distance per member and is exact. At an
+// eighth of the corpus that trade is comfortably in favour of the scan for
+// any realistic efSearch, and it removes the recall cliff entirely.
+const bruteSelectivityDivisor = 8
+
+// bruteBeatsGraph reports whether an allow-set is small enough, relative to
+// the corpus, that an exact scan over it is the better plan.
+func bruteBeatsGraph(allowed map[string]struct{}, count uint64) bool {
+	if allowed == nil {
+		return false
+	}
+
+	limit := int(count / bruteSelectivityDivisor)
+	if limit < bruteThreshold {
+		limit = bruteThreshold
+	}
+
+	return len(allowed) <= limit
+}
+
+// bruteSearch answers a query exactly, by scoring every candidate rather
+// than navigating the graph.
+//
+// When the caller supplied an allow-set the candidates are its members and
+// nothing else. Iterating the whole vector keyspace to reject almost all of
+// it — which is what this did before — makes a query over a small tenant
+// cost as much as a query over the entire corpus, so the more selective the
+// filter, the slower the query got. Reading the members directly also lets
+// the decoded-vector cache serve repeat queries, and folds the separate
+// tombstone lookup into the same cache entry.
+//
+// Without an allow-set there is nothing to drive the scan but the keyspace
+// itself, so that path still iterates.
 func (vi *vectorIndex) bruteSearch(
+	ctx context.Context,
 	btx *badger.Txn,
 	q []float32,
 	k int,
 	metric VectorMetric,
 	allowed map[string]struct{},
 ) ([]minHeapItem, error) {
-	prefix := vecRawPrefix(vi.bucket, vi.field.Name)
 	heap := newMinHeap(k)
+
+	var err error
+	if allowed != nil {
+		err = vi.bruteScanAllowed(ctx, btx, q, metric, allowed, heap)
+	} else {
+		err = vi.bruteScanAll(ctx, btx, q, metric, heap)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	hits := heap.drain()
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].score != hits[j].score {
+			return hits[i].score > hits[j].score
+		}
+		return string(hits[i].pk) < string(hits[j].pk)
+	})
+	return hits, nil
+}
+
+// bruteScanAllowed scores exactly the members of the allow-set.
+//
+// Members are visited in sorted order so the Badger point reads follow the
+// same ordering as the keyspace, and so a query is reproducible independent
+// of Go's map iteration order.
+func (vi *vectorIndex) bruteScanAllowed(
+	ctx context.Context,
+	btx *badger.Txn,
+	q []float32,
+	metric VectorMetric,
+	allowed map[string]struct{},
+	heap *minHeap,
+) error {
+	sc := newQueryScorer(metric, q)
+
+	pks := make([]string, 0, len(allowed))
+	for pk := range allowed {
+		pks = append(pks, pk)
+	}
+	sort.Strings(pks)
+
+	for i, pk := range pks {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
+		ent, err := vi.readVecEntry(btx, []byte(pk))
+		if err != nil {
+			// A pk in the allow-set with no vector is a record whose
+			// vector field was empty, not corruption.
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				continue
+			}
+
+			return err
+		}
+		if ent.tomb {
+			continue
+		}
+
+		s, err := sc.score(ent.vec)
+		if err != nil {
+			return err
+		}
+		heap.push(minHeapItem{pk: []byte(pk), score: s})
+	}
+
+	return nil
+}
+
+// bruteScanAll streams the whole vector keyspace. This is the unfiltered
+// small-graph path and the metric-override path.
+func (vi *vectorIndex) bruteScanAll(
+	ctx context.Context,
+	btx *badger.Txn,
+	q []float32,
+	metric VectorMetric,
+	heap *minHeap,
+) error {
+	prefix := vecRawPrefix(vi.bucket, vi.field.Name)
+
+	sc := newQueryScorer(metric, q)
 
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = prefix
@@ -1919,20 +2234,23 @@ func (vi *vectorIndex) bruteSearch(
 	it := btx.NewIterator(opts)
 	defer it.Close()
 
+	seen := 0
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		if seen%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		seen++
+
 		item := it.Item()
 		pk := pkFromVecRawKey(item.KeyCopy(nil), prefix)
 		if pk == nil {
 			continue
 		}
-		if allowed != nil {
-			if _, ok := allowed[string(pk)]; !ok {
-				continue
-			}
-		}
 		dead, err := vi.isTombstoned(btx, pk)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if dead {
 			continue
@@ -1944,22 +2262,16 @@ func (vi *vectorIndex) bruteSearch(
 			return derr
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
-		s, err := scoreChecked(metric, q, v)
+		s, err := sc.score(v)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		heap.push(minHeapItem{pk: pk, score: s})
 	}
-	hits := heap.drain()
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].score != hits[j].score {
-			return hits[i].score > hits[j].score
-		}
-		return string(hits[i].pk) < string(hits[j].pk)
-	})
-	return hits, nil
+
+	return nil
 }
 
 // compact rebuilds the vector namespace from live raw vectors. The caller
@@ -2049,7 +2361,7 @@ func (vi *vectorIndex) compact(ctx context.Context, db *DB) error {
 			if err := btx.Delete(vecRawKey(vi.bucket, vi.field.Name, stored.pk)); err != nil {
 				return err
 			}
-			return vi.writeVec(btx, stored.pk, stored.v)
+			return vi.writeVec(ctx, btx, stored.pk, stored.v)
 		}); err != nil {
 			return err
 		}

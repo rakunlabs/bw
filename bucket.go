@@ -578,7 +578,18 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 		}
 	}
 
-	val, err := b.codec.Marshal(record)
+	// The vector index keeps its own copy of the embedding, so a field
+	// declared vector(inline=false) is dropped from the record's encoded
+	// value. Encode a shallow clone rather than the caller's record: the
+	// caller keeps whatever it passed in.
+	marshalRec := record
+	if b.vecIdx != nil && b.vecIdx.noInline && len(vector) > 0 {
+		clone := *record
+		b.vecIdx.clearVector(&clone)
+		marshalRec = &clone
+	}
+
+	val, err := b.codec.Marshal(marshalRec)
 	if err != nil {
 		return err
 	}
@@ -609,7 +620,7 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 	// Vector field, same atomicity story.
 	if b.vecIdx != nil {
 		if vector != nil {
-			if err := b.vecIdx.writeVec(tx.btx, pk, vector); err != nil {
+			if err := b.vecIdx.writeVec(ctx, tx.btx, pk, vector); err != nil {
 				return fmt.Errorf("bw: vector write: %w", err)
 			}
 		} else if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
@@ -923,6 +934,72 @@ func (b *Bucket[T]) scan(btx *badger.Txn, q *query.Query) ([]engine.Match, error
 // allocation-free apart from the plan's own residual slice.
 func (b *Bucket[T]) plan(q *query.Query) engine.Plan {
 	return engine.PlanQuery(q, b.indexedQueryFields, b.compositeQueryFields...)
+}
+
+// scanKeys returns the primary keys matching q, decoding records only when
+// the plan forces it.
+//
+// A pure index plan carries the primary key inside the index entry, so the
+// key set can be recovered from the index keyspace alone. Anything else — a
+// full scan, a residual predicate, or paging that has to be applied to
+// ordered records — falls back to materialising the records and extracting
+// their keys, which is what the bucket did unconditionally before.
+//
+// The distinction is worth the branch on a vector bucket: there the record
+// body is dominated by a copy of the embedding, so materialising the filter
+// set costs a multiple of the corpus in decode work and allocation for a
+// result the caller reduces to keys anyway.
+func (b *Bucket[T]) scanKeys(tx *Tx, q *query.Query) ([][]byte, error) {
+	if err := b.checkCurrent(); err != nil {
+		return nil, err
+	}
+	if tx.db != b.db {
+		return nil, fmt.Errorf("bw: transaction belongs to another database")
+	}
+
+	plan := b.plan(q)
+	if keysOnlyEligible(plan, q) {
+		return engine.IndexScanKeys(tx.btx, b.indexScanOpts(plan, q))
+	}
+
+	matches, err := b.findTx(tx, q)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([][]byte, 0, len(matches))
+	for _, m := range matches {
+		pk, err := b.keyFn(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pk)
+	}
+
+	return out, nil
+}
+
+// keysOnlyEligible reports whether a plan's key set can be read straight off
+// the index keyspace.
+//
+// Sort, Offset and Limit are disqualifying even though the index walk could
+// honour some of them: they select *which* records survive, and applying
+// them correctly needs either the record (to sort by a non-index field) or a
+// defined order the key-only walk does not promise. Callers wanting a key set
+// do not normally page it, so refusing is cheaper than getting it subtly
+// wrong.
+func keysOnlyEligible(plan engine.Plan, q *query.Query) bool {
+	if plan.Kind != engine.PlanIndexEq && plan.Kind != engine.PlanIndexRange {
+		return false
+	}
+	if len(plan.ResidualWhere) > 0 {
+		return false
+	}
+	if q == nil {
+		return true
+	}
+
+	return len(q.Sort) == 0 && q.GetOffset() == 0 && q.GetLimit() == 0
 }
 
 func (b *Bucket[T]) indexScanOpts(plan engine.Plan, q *query.Query) engine.IndexScanOptions {
@@ -1407,24 +1484,20 @@ func (b *Bucket[T]) SearchVector(ctx context.Context, q []float32, opts ...Searc
 			if !ok {
 				return fmt.Errorf("bw: SearchVector Filter must be *query.Query, got %T", so.Filter)
 			}
-			matches, err := b.findTx(tx, qq)
+			pks, err := b.scanKeys(tx, qq)
 			if err != nil {
 				return err
 			}
-			if len(matches) == 0 {
+			if len(pks) == 0 {
 				return nil
 			}
-			allowed = make(map[string]struct{}, len(matches))
-			for _, match := range matches {
-				pk, err := b.keyFn(match)
-				if err != nil {
-					return err
-				}
+			allowed = make(map[string]struct{}, len(pks))
+			for _, pk := range pks {
 				allowed[string(pk)] = struct{}{}
 			}
 		}
 
-		err := b.vecIdx.search(tx.btx, q, so.K, so.EfSearch, metric, allowed, func(pk []byte, score float64) error {
+		err := b.vecIdx.search(ctx, tx.btx, q, so.K, so.EfSearch, metric, allowed, func(pk []byte, score float64) error {
 			item, gErr := tx.btx.Get(dataKey(b.name, pk))
 			if gErr != nil {
 				if errors.Is(gErr, badger.ErrKeyNotFound) {

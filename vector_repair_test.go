@@ -108,7 +108,7 @@ func TestVectorCorruptGraphMetadataReturnsErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = db.bdb.View(func(tx *badger.Txn) error {
-		if _, err := bucket.vecIdx.readNeighbours(tx, pk, 0); err == nil {
+		if _, err := bucket.vecIdx.readNeighbours(tx, nil, pk, 0); err == nil {
 			t.Fatal("oversized neighbour count did not return an error")
 		}
 		if _, err := bucket.vecIdx.readLevel(tx, pk); err == nil {
@@ -179,7 +179,7 @@ func TestVectorGraphEdgesRemainReciprocalAndUniqueAfterUpdates(t *testing.T) {
 				return err
 			}
 			for graphLevel := uint8(0); graphLevel <= level; graphLevel++ {
-				neighbours, err := bucket.vecIdx.readNeighbours(tx, pk, graphLevel)
+				neighbours, err := bucket.vecIdx.readNeighbours(tx, nil, pk, graphLevel)
 				if err != nil {
 					return err
 				}
@@ -189,7 +189,7 @@ func TestVectorGraphEdgesRemainReciprocalAndUniqueAfterUpdates(t *testing.T) {
 						t.Fatalf("duplicate edge %q -> %q at level %d", pk, neighbour, graphLevel)
 					}
 					seen[string(neighbour)] = struct{}{}
-					reverse, err := bucket.vecIdx.readNeighbours(tx, neighbour, graphLevel)
+					reverse, err := bucket.vecIdx.readNeighbours(tx, nil, neighbour, graphLevel)
 					if err != nil {
 						return err
 					}

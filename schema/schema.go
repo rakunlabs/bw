@@ -57,6 +57,20 @@ type Field struct {
 	// Empty string means "use the bucket default" (cosine).
 	// Recognised values: "cosine", "dot", "l2".
 	VectorMetric string
+	// VectorNoInline drops the embedding from the record's encoded value,
+	// leaving the vector index as its only copy.
+	//
+	// A vector is always written to its own keyspace; keeping it in the
+	// record too is a second copy that nothing reads. At the widths
+	// embedding models produce it is also the larger copy — msgpack spends
+	// five bytes per float32 — so it dominates the stored size of a record
+	// and the cost of every scan that has to decode one.
+	//
+	// The trade is that reads return the field empty, so it is off by
+	// default and opt-in per field via `vector(inline=false)`. Set it only
+	// when the vector is written but never read back, which is the usual
+	// shape for a RAG chunk store.
+	VectorNoInline bool
 }
 
 // CompositeGroup describes a named group of fields that form a composite
@@ -484,6 +498,15 @@ func parseVectorParams(params string, f *Field) error {
 				f.VectorMetric = val
 			default:
 				return fmt.Errorf("vector metric %q: want cosine|dot|l2", val)
+			}
+		case "inline":
+			switch val {
+			case "true":
+				f.VectorNoInline = false
+			case "false":
+				f.VectorNoInline = true
+			default:
+				return fmt.Errorf("vector inline %q: want true|false", val)
 			}
 		default:
 			return fmt.Errorf("vector param %q: unknown key", key)
