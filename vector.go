@@ -1,6 +1,7 @@
 package bw
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -920,18 +921,38 @@ func (vi *vectorIndex) writeVec(ctx context.Context, btx *badger.Txn, pk []byte,
 	}
 
 	rawKey := vecRawKey(vi.bucket, vi.field.Name, pk)
+	newRaw := encodeVector(v)
 
 	// Existing nodes, including tombstoned routing nodes, must be
 	// removed from the graph before the replacement is installed.
 	hadRaw := false
-	if _, gErr := btx.Get(rawKey); gErr == nil {
+	unchanged := false
+	if item, gErr := btx.Get(rawKey); gErr == nil {
 		hadRaw = true
+		if vErr := item.Value(func(val []byte) error {
+			unchanged = bytes.Equal(val, newRaw)
+
+			return nil
+		}); vErr != nil {
+			return vErr
+		}
 	} else if !errors.Is(gErr, badger.ErrKeyNotFound) {
 		return gErr
 	}
 	wasTombstoned, err := vi.isTombstoned(btx, pk)
 	if err != nil {
 		return err
+	}
+
+	// Rewriting a record without changing its embedding is the common
+	// case for anything that is not itself about the embedding: a
+	// migration that adds a field, a re-index of a document whose text is
+	// unchanged, an update to a neighbouring column. The geometry is
+	// identical, so the node's place in the graph is identical too —
+	// removing it and inserting it again would spend a full HNSW insert
+	// to rebuild the edges it already has.
+	if unchanged && !wasTombstoned {
+		return nil
 	}
 
 	if hadRaw || wasTombstoned {
@@ -949,7 +970,7 @@ func (vi *vectorIndex) writeVec(ctx context.Context, btx *badger.Txn, pk []byte,
 	if err := btx.Delete(vecTombKey(vi.bucket, vi.field.Name, pk)); err != nil {
 		return err
 	}
-	if err := btx.Set(rawKey, encodeVector(v)); err != nil {
+	if err := btx.Set(rawKey, newRaw); err != nil {
 		return err
 	}
 

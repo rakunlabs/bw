@@ -50,9 +50,17 @@ type RawMigrationFn func(ctx context.Context, raw []byte) ([]byte, error)
 
 // userMigration is one registered migration step.
 type userMigration struct {
-	fromV         uint64
-	toV           uint64
-	apply         RawMigrationFn
+	fromV uint64
+	toV   uint64
+	apply RawMigrationFn
+	// vectorReembed marks a step that replaces every embedding, so the
+	// vector keyspace is wiped and rebuilt from what the step returns
+	// rather than being updated record by record.
+	//
+	// Only WithVectorReembed sets it. A typed or raw migration usually
+	// carries the existing embedding through untouched — adding a field,
+	// splitting a column — and wiping the index for those would rebuild
+	// the whole graph to arrive back at the graph it started with.
 	vectorReembed bool
 }
 
@@ -106,10 +114,9 @@ func WithTypedMigration[Old, New any](fromV, toV uint64, fn func(ctx context.Con
 			return out, nil
 		}
 		b.userMigrations = append(b.userMigrations, userMigration{
-			fromV:         fromV,
-			toV:           toV,
-			apply:         raw,
-			vectorReembed: true,
+			fromV: fromV,
+			toV:   toV,
+			apply: raw,
 		})
 	}
 }
@@ -143,9 +150,10 @@ func WithVectorReembed[T any](fromV, toV uint64, embedder func(ctx context.Conte
 			return out, nil
 		}
 		b.userMigrations = append(b.userMigrations, userMigration{
-			fromV: fromV,
-			toV:   toV,
-			apply: raw,
+			fromV:         fromV,
+			toV:           toV,
+			apply:         raw,
+			vectorReembed: true,
 		})
 	}
 }
