@@ -314,7 +314,37 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 		// the data write. ctx is threaded through to the user
 		// fn so it can honour cancellation (network calls).
 		if err := b.applyMigrationBatch(ctx, step, batch); err != nil {
-			return err
+			// How many records fit in one transaction is not a
+			// property this code can know: Badger derives the limit
+			// from the memtable size, and how much of it a record
+			// consumes depends on the record. A full-text write
+			// expands into one key per distinct term, so a batch of
+			// verbose documents can exceed the limit that the same
+			// batch of short ones sits comfortably inside.
+			//
+			// Halve and retry rather than fail the migration. Badger
+			// discards a rejected transaction, so nothing was written
+			// and re-reading from the same cursor is safe. The reduced
+			// size is kept for the remaining batches: records in one
+			// bucket are near-uniform, so the limit is discovered once
+			// instead of being rediscovered per batch.
+			if !errors.Is(err, badger.ErrTxnTooBig) {
+				return err
+			}
+			if batchSize <= 1 {
+				// A single record that does not fit cannot be split
+				// any further, so this is the one case the runner
+				// cannot work around on its own.
+				return fmt.Errorf("bw: migration v%d->v%d: one record of bucket %q does not fit in a "+
+					"transaction; raise the memtable size (badger.Options.MemTableSize): %w",
+					step.fromV, step.toV, b.name, err)
+			}
+
+			batchSize /= 2
+			slog.Debug("bw: migration batch shrunk to fit the transaction limit",
+				"bucket", b.name, "fromV", step.fromV, "toV", step.toV, "batch", batchSize)
+
+			continue
 		}
 		// Advance the resume cursor in its own tiny txn so the
 		// data write is durable before we record progress.

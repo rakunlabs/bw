@@ -9,6 +9,7 @@ import (
 
 	"github.com/rakunlabs/bw"
 	"github.com/rakunlabs/bw/codec"
+	"github.com/rakunlabs/query"
 )
 
 // --- shared types ---
@@ -550,5 +551,110 @@ func TestUserMigration_ExistingBucketStillMigrates(t *testing.T) {
 	}
 	if got.Email != "ali.veli@example.com" {
 		t.Fatalf("Email = %q, want the migration to have filled it", got.Email)
+	}
+}
+
+// ftsDocV1 / ftsDocV2 model a full-text bucket that gains a field.
+type ftsDocV1 struct {
+	ID   string `bw:"id,pk"`
+	Body string `bw:"body,fts"`
+}
+
+type ftsDocV2 struct {
+	ID   string `bw:"id,pk"`
+	Kind string `bw:"kind,index"`
+	Body string `bw:"body,fts"`
+}
+
+// wideText builds a document of n distinct terms, so one record expands into
+// n full-text keys.
+func wideText(seed, n int) string {
+	var sb strings.Builder
+	for i := range n {
+		fmt.Fprintf(&sb, "t%dw%d ", seed, i)
+	}
+
+	return sb.String()
+}
+
+// TestUserMigration_ShrinksBatchToFitTransaction covers a migration whose
+// per-record write fan-out is large enough that the default batch cannot
+// commit.
+//
+// How many records fit in one Badger transaction is not knowable up front:
+// the limit comes from the memtable size, and a full-text write costs one key
+// per distinct term. A bucket of verbose documents therefore blew the limit
+// and failed the migration outright — with the bucket half-migrated and the
+// only recovery being to make the documents shorter.
+func TestUserMigration_ShrinksBatchToFitTransaction(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	db1, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, err := bw.RegisterBucket[ftsDocV1](db1, "docs", bw.WithVersion[ftsDocV1](1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const docs = 200
+	for i := range docs {
+		if err := b1.Insert(ctx, &ftsDocV1{ID: fmt.Sprintf("d%04d", i), Body: wideText(i, 3000)}); err != nil {
+			t.Fatalf("seed insert %d: %v", i, err)
+		}
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	migrated := 0
+	b2, err := bw.RegisterBucket[ftsDocV2](db2, "docs",
+		bw.WithVersion[ftsDocV2](2),
+		bw.WithTypedMigration(1, 2, func(_ context.Context, old *ftsDocV1) (*ftsDocV2, error) {
+			migrated++
+
+			return &ftsDocV2{ID: old.ID, Kind: "doc", Body: old.Body}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("migrating a bucket with a large full-text fan-out: %v", err)
+	}
+
+	// Every record must have been migrated, not just the ones before the
+	// batch that would have failed.
+	if migrated < docs {
+		t.Fatalf("the migration callback saw %d records, want at least %d", migrated, docs)
+	}
+
+	for _, id := range []string{"d0000", "d0099", "d0199"} {
+		got, err := b2.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if got.Kind != "doc" {
+			t.Fatalf("%s: Kind = %q, want the migration to have filled it", id, got.Kind)
+		}
+	}
+
+	// The new index must be usable, which means the FTS postings were
+	// rewritten rather than left behind by a partial batch.
+	q, err := query.Parse("kind=doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := b2.Find(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != docs {
+		t.Fatalf("kind index returned %d records, want %d", len(found), docs)
 	}
 }
