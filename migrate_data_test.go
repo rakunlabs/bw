@@ -15,7 +15,7 @@ import (
 // --- shared types ---
 //
 // We define the v1 and v2 shapes inline so the tests double as
-// living documentation of how user migrations are expected to be
+// living documentation of how data migrations are expected to be
 // structured (define the old struct, decode-transform-encode in the
 // migration callback, swap the bucket type to the new struct).
 
@@ -40,9 +40,9 @@ type userV3 struct {
 	Email string `bw:"email,index"`
 }
 
-// TestUserMigration_TypedSingleStep validates the simplest path: one
+// TestDataMigration_TypedSingleStep validates the simplest path: one
 // typed migration step from v1 to v2.
-func TestUserMigration_TypedSingleStep(t *testing.T) {
+func TestDataMigration_TypedSingleStep(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -114,9 +114,9 @@ func TestUserMigration_TypedSingleStep(t *testing.T) {
 	}
 }
 
-// TestUserMigration_TypedMultiStep chains v1 -> v2 -> v3 in a single
+// TestDataMigration_TypedMultiStep chains v1 -> v2 -> v3 in a single
 // RegisterBucket call.
-func TestUserMigration_TypedMultiStep(t *testing.T) {
+func TestDataMigration_TypedMultiStep(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -163,10 +163,10 @@ func TestUserMigration_TypedMultiStep(t *testing.T) {
 	}
 }
 
-// TestUserMigration_RawBytes uses the byte-level API. Demonstrates the
+// TestDataMigration_RawBytes uses the byte-level API. Demonstrates the
 // codec.UnmarshalMap path for callers who don't want to maintain the
 // old struct definition.
-func TestUserMigration_RawBytes(t *testing.T) {
+func TestDataMigration_RawBytes(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -203,9 +203,9 @@ func TestUserMigration_RawBytes(t *testing.T) {
 	}
 }
 
-// TestUserMigration_MissingStep ensures a chain with a gap fails
+// TestDataMigration_MissingStep ensures a chain with a gap fails
 // loudly rather than silently skipping data.
-func TestUserMigration_MissingStep(t *testing.T) {
+func TestDataMigration_MissingStep(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -232,11 +232,11 @@ func TestUserMigration_MissingStep(t *testing.T) {
 	}
 }
 
-// TestUserMigration_FailureRollsBackBatch verifies that an error from
+// TestDataMigration_FailureRollsBackBatch verifies that an error from
 // the user fn aborts the migration without losing data: the records
 // in the failed batch revert to their pre-migration state and the
 // schema version stays unchanged.
-func TestUserMigration_FailureRollsBackBatch(t *testing.T) {
+func TestDataMigration_FailureRollsBackBatch(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -275,10 +275,10 @@ func TestUserMigration_FailureRollsBackBatch(t *testing.T) {
 	}
 }
 
-// TestUserMigration_Resumable simulates a crash mid-migration by
+// TestDataMigration_Resumable simulates a crash mid-migration by
 // writing a progress key by hand and verifying that the next run
 // picks up where it left off without re-processing earlier records.
-func TestUserMigration_Resumable(t *testing.T) {
+func TestDataMigration_Resumable(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -352,9 +352,9 @@ func TestUserMigration_Resumable(t *testing.T) {
 	}
 }
 
-// TestUserMigration_VectorReembed exercises the WithVectorReembed
+// TestDataMigration_VectorReembed exercises the WithVectorReembed
 // shorthand: only the vector field changes between schema versions.
-func TestUserMigration_VectorReembed(t *testing.T) {
+func TestDataMigration_VectorReembed(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -406,8 +406,8 @@ func TestUserMigration_VectorReembed(t *testing.T) {
 	}
 }
 
-// TestUserMigration_Progress exercises the optional progress hook.
-func TestUserMigration_Progress(t *testing.T) {
+// TestDataMigration_Progress exercises the optional progress hook.
+func TestDataMigration_Progress(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -451,7 +451,7 @@ func TestUserMigration_Progress(t *testing.T) {
 	}
 }
 
-// TestUserMigration_FreshBucketSkipsChain covers registering a versioned
+// TestDataMigration_FreshBucketSkipsChain covers registering a versioned
 // bucket that has never existed before.
 //
 // A new database has no records, so there is nothing for a migration to
@@ -460,7 +460,7 @@ func TestUserMigration_Progress(t *testing.T) {
 // effect was that no fresh deployment could use WithVersion together with any
 // migration, which is exactly the combination a schema that has evolved once
 // will have.
-func TestUserMigration_FreshBucketSkipsChain(t *testing.T) {
+func TestDataMigration_FreshBucketSkipsChain(t *testing.T) {
 	ctx := context.Background()
 
 	db, err := bw.Open(t.TempDir(), bw.WithLogger(nil))
@@ -502,10 +502,10 @@ func TestUserMigration_FreshBucketSkipsChain(t *testing.T) {
 	}
 }
 
-// TestUserMigration_ExistingBucketStillMigrates is the other side of the
+// TestDataMigration_ExistingBucketStillMigrates is the other side of the
 // fresh-bucket check: a bucket that does hold records must still run its
 // chain, so the fix cannot be "never migrate when the version is 0".
-func TestUserMigration_ExistingBucketStillMigrates(t *testing.T) {
+func TestDataMigration_ExistingBucketStillMigrates(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -577,7 +577,7 @@ func wideText(seed, n int) string {
 	return sb.String()
 }
 
-// TestUserMigration_ShrinksBatchToFitTransaction covers a migration whose
+// TestDataMigration_ShrinksBatchToFitTransaction covers a migration whose
 // per-record write fan-out is large enough that the default batch cannot
 // commit.
 //
@@ -586,7 +586,7 @@ func wideText(seed, n int) string {
 // per distinct term. A bucket of verbose documents therefore blew the limit
 // and failed the migration outright — with the bucket half-migrated and the
 // only recovery being to make the documents shorter.
-func TestUserMigration_ShrinksBatchToFitTransaction(t *testing.T) {
+func TestDataMigration_ShrinksBatchToFitTransaction(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 

@@ -59,7 +59,7 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 	}
 	if storedFingerprint != "" && storedFingerprint != s.Fingerprint() {
 		b.epoch = db.invalidateBucket(name)
-	} else if b.version > 0 && len(b.userMigrations) > 0 {
+	} else if b.version > 0 && len(b.dataMigrations) > 0 {
 		storedVersion, err := b.readStoredVersion()
 		if err != nil {
 			return nil, err
@@ -137,7 +137,7 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 	if err != nil {
 		return nil, err
 	}
-	if _, err := b.runUserMigrations(context.Background(), storedV); err != nil {
+	if _, err := b.runDataMigrations(context.Background(), storedV); err != nil {
 		return nil, err
 	}
 	if err := b.reconcileVectorStorage(context.Background()); err != nil {

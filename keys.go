@@ -425,7 +425,7 @@ func appendLP(dst, b []byte) []byte {
 }
 
 // migProgressKey returns the per-bucket key holding the in-flight
-// user migration's resume cursor. The value is the last successfully
+// data migration's resume cursor. The value is the last successfully
 // migrated pk, or absent when no migration is running.
 //
 // Layout: \x00mig\x00<bucket>\x00<fromV>\x00<toV>\x00progress

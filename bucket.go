@@ -68,14 +68,14 @@ type Bucket[T any] struct {
 	// let bw call out to an embedding model.
 	embedder func(ctx context.Context, record any) ([]float32, error)
 
-	// userMigrations is the list of (fromV, toV, applyFn) steps the
+	// dataMigrations is the list of (fromV, toV, applyFn) steps the
 	// caller registered via WithRawMigration / WithTypedMigration /
 	// WithVectorReembed. Applied during RegisterBucket once the
 	// schema-level migration has settled.
-	userMigrations []userMigration
+	dataMigrations []dataMigration
 
 	// migrationProgress is an optional hook fired between batches
-	// during user migration runs. See WithMigrationProgress.
+	// during data migration runs. See WithMigrationProgress.
 	migrationProgress MigrationProgress
 	epoch             uint64
 }
@@ -202,7 +202,7 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 				name, b.version, storedVersion)
 		}
 		b.epoch = db.invalidateBucket(name)
-	} else if b.version > 0 && len(b.userMigrations) > 0 {
+	} else if b.version > 0 && len(b.dataMigrations) > 0 {
 		storedVersion, err := b.readStoredVersion()
 		if err != nil {
 			return nil, err
@@ -253,7 +253,7 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		}
 	}
 
-	// Open the FTS / vector handles up front so user migrations
+	// Open the FTS / vector handles up front so data migrations
 	// (which call Insert internally) reach the full maintenance
 	// path. They're cheap config records — no I/O happens until a
 	// write fires.
@@ -279,7 +279,7 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		db.vec.set(name, vi)
 	}
 
-	// User migrations run BEFORE the schema reconcile step so a
+	// Data migrations run BEFORE the schema reconcile step so a
 	// failure leaves the stored fingerprint and version untouched
 	// (callers can re-open with the previous T and read their data
 	// as if no migration had been attempted). Each migration step
@@ -289,7 +289,7 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 	if err != nil {
 		return nil, err
 	}
-	if _, err := b.runUserMigrations(context.Background(), storedV); err != nil {
+	if _, err := b.runDataMigrations(context.Background(), storedV); err != nil {
 		return nil, err
 	}
 	if err := b.reconcileVectorStorage(context.Background()); err != nil {
@@ -1548,7 +1548,7 @@ func (b *Bucket[T]) CompactVectors(ctx context.Context) error {
 }
 
 // reconcileVectorStorage aligns the persisted vector namespace with the
-// current schema. It is used during registration after user migrations have
+// current schema. It is used during registration after data migrations have
 // transformed the records into their final shape.
 func (b *Bucket[T]) reconcileVectorStorage(ctx context.Context) error {
 	if ctx == nil {

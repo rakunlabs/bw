@@ -341,3 +341,172 @@ func TestWriteVecSkipsUnchangedVector(t *testing.T) {
 		t.Fatal("changing the embedding did not rewrite its stored vector")
 	}
 }
+
+// TestMigrationStepRecordsVersionAtomically closes a window in which a crash
+// could destroy data.
+//
+// The runner used to clear the resume cursor in one transaction and record the
+// new version in the next. A process that died between the two came back with
+// no cursor and the old version, so the step replayed from the first record.
+// That is harmless for a migration that only adds information — but a v3 like
+// this bucket's moves the embedding out of the record body, so a replay would
+// read records that no longer carry one and write back the absence, silently
+// emptying the index.
+//
+// The step is driven directly rather than through RegisterBucket, because
+// RegisterBucket also bumps the version on its way out: the difference between
+// the two orderings is only visible from inside the chain.
+func TestMigrationStepRecordsVersionAtomically(t *testing.T) {
+	const (
+		n   = 30
+		dim = 32
+	)
+
+	dir := t.TempDir()
+	seedMigChunks(t, dir, n, dim)
+
+	db, err := Open(dir, WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	b, err := RegisterBucket[migChunkV1](db, "chunks", WithVersion[migChunkV1](1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	step := dataMigration{
+		fromV: 1,
+		toV:   2,
+		apply: func(_ context.Context, raw []byte) ([]byte, error) {
+			return raw, nil
+		},
+	}
+
+	if err := b.runMigrationStep(context.Background(), step); err != nil {
+		t.Fatal(err)
+	}
+
+	// The step itself must have recorded the version. If it has not, a crash
+	// here would replay the whole step.
+	storedV, err := b.readStoredVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedV != step.toV {
+		t.Fatalf("stored version = %d after the step, want %d recorded by the step itself", storedV, step.toV)
+	}
+
+	// And the resume cursor must be gone in the same breath, so a restart
+	// never sees a step that looks half-finished.
+	resume, err := b.readMigrationResume(migProgressKey("chunks", step.fromV, step.toV))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resume) != 0 {
+		t.Fatalf("resume cursor survived a completed step: %x", resume)
+	}
+}
+
+// TestMigrationSurvivesRestartWithoutLosingVectors is the end-to-end answer to
+// "is it safe to restart mid-migration".
+//
+// The migration is interrupted partway, then re-run on a fresh open. Every
+// record must end up migrated exactly once, with its embedding intact — the
+// property that matters when the new shape no longer stores the embedding in
+// the record and the only other copy is the one the migration is writing.
+func TestMigrationSurvivesRestartWithoutLosingVectors(t *testing.T) {
+	const (
+		n   = 200
+		dim = 32
+	)
+
+	dir := t.TempDir()
+	seedMigChunks(t, dir, n, dim)
+
+	// First attempt: fail partway through.
+	crashAfter := 90
+	seen := 0
+
+	crashDB, err := Open(dir, WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RegisterBucket[migChunkV2](crashDB, "chunks", WithVersion[migChunkV2](2),
+		WithTypedMigration(1, 2, func(_ context.Context, old *migChunkV1) (*migChunkV2, error) {
+			seen++
+			if seen > crashAfter {
+				return nil, fmt.Errorf("simulated restart")
+			}
+
+			return &migChunkV2{ID: old.ID, Repo: old.Repo, Kind: "repo", Body: old.Body, Emb: old.Emb}, nil
+		}),
+	)
+	if err == nil {
+		_ = crashDB.Close()
+		t.Fatal("expected the interrupted migration to report an error")
+	}
+	if err := crashDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart: the run picks up from the cursor instead of starting over.
+	resumed := 0
+
+	db, err := Open(dir, WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	b, err := RegisterBucket[migChunkV2](db, "chunks", WithVersion[migChunkV2](2),
+		WithTypedMigration(1, 2, func(_ context.Context, old *migChunkV1) (*migChunkV2, error) {
+			resumed++
+
+			return &migChunkV2{ID: old.ID, Repo: old.Repo, Kind: "repo", Body: old.Body, Emb: old.Emb}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("resuming after a restart: %v", err)
+	}
+
+	if resumed >= n {
+		t.Fatalf("the restart replayed %d of %d records; the resume cursor was not honoured", resumed, n)
+	}
+
+	ctx := context.Background()
+
+	// Every record migrated, none lost.
+	q, err := query.Parse("kind=repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := b.Find(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != n {
+		t.Fatalf("got %d migrated records, want %d", len(found), n)
+	}
+
+	// And every embedding survived: each record must still be its own
+	// nearest neighbour.
+	for _, id := range []string{"c0000", "c0089", "c0090", "c0199"} {
+		rec, err := b.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if len(rec.Emb) != dim {
+			t.Fatalf("%s: embedding has %d components, want %d", id, len(rec.Emb), dim)
+		}
+
+		hits, err := b.SearchVector(ctx, rec.Emb, SearchVectorOptions{K: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) != 1 || hits[0].Record.ID != id {
+			t.Fatalf("%s is not its own nearest neighbour: %+v", id, hits)
+		}
+	}
+}

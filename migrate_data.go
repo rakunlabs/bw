@@ -13,10 +13,14 @@ import (
 	"github.com/rakunlabs/bw/schema"
 )
 
-// User migrations let callers transform every record in a bucket as
-// part of a schema version bump. They run after RegisterBucket has
-// reconciled the static schema (indexes, manifest, fingerprint) but
-// before the bucket is handed back to the caller.
+// Data migrations let callers transform every record in a bucket as
+// part of a schema version bump.
+//
+// They run inside RegisterBucket, before the static schema (indexes,
+// manifest, fingerprint) is reconciled, so a failed migration leaves
+// the stored schema metadata untouched and the caller can re-open
+// with the previous type and read the data as if nothing had been
+// attempted.
 //
 // Each migration is bound to a (fromVersion, toVersion) pair. When
 // RegisterBucket sees that the stored bucket version is below the
@@ -38,18 +42,23 @@ import (
 //     changed is the vector field; recompute it for every record".
 //
 // All three paths feed into the same runner: per-batch Badger
-// transactions (so very large buckets don't blow ErrTxnTooBig), a
-// resume cursor written between batches (so a crash leaves a
-// well-defined partial state to pick up from), and full secondary-
+// transactions that shrink themselves when a batch does not fit, a
+// resume cursor written after each committed batch (so a crash leaves
+// a well-defined partial state to pick up from), and full secondary-
 // index / FTS / vector maintenance via the standard Insert path.
+//
+// A completed step clears its resume cursor and records the new
+// version in one transaction, so a step is never observable as
+// finished-but-unrecorded — a state that would replay the step from
+// the first record.
 
 // RawMigrationFn transforms the encoded bytes of one record. It must
 // be deterministic and idempotent (the runner may legitimately replay
 // the same record on resume).
 type RawMigrationFn func(ctx context.Context, raw []byte) ([]byte, error)
 
-// userMigration is one registered migration step.
-type userMigration struct {
+// dataMigration is one registered migration step.
+type dataMigration struct {
 	fromV uint64
 	toV   uint64
 	apply RawMigrationFn
@@ -73,7 +82,7 @@ type userMigration struct {
 // WithRawMigration repeatedly with consecutive (fromV, toV) pairs.
 func WithRawMigration[T any](fromV, toV uint64, fn RawMigrationFn) BucketOption[T] {
 	return func(b *Bucket[T]) {
-		b.userMigrations = append(b.userMigrations, userMigration{
+		b.dataMigrations = append(b.dataMigrations, dataMigration{
 			fromV: fromV,
 			toV:   toV,
 			apply: fn,
@@ -113,7 +122,7 @@ func WithTypedMigration[Old, New any](fromV, toV uint64, fn func(ctx context.Con
 			}
 			return out, nil
 		}
-		b.userMigrations = append(b.userMigrations, userMigration{
+		b.dataMigrations = append(b.dataMigrations, dataMigration{
 			fromV: fromV,
 			toV:   toV,
 			apply: raw,
@@ -149,7 +158,7 @@ func WithVectorReembed[T any](fromV, toV uint64, embedder func(ctx context.Conte
 			}
 			return out, nil
 		}
-		b.userMigrations = append(b.userMigrations, userMigration{
+		b.dataMigrations = append(b.dataMigrations, dataMigration{
 			fromV:         fromV,
 			toV:           toV,
 			apply:         raw,
@@ -182,7 +191,7 @@ func WithMigrationProgress[T any](fn MigrationProgress) BucketOption[T] {
 // and a vector field can produce ~10-20 Badger writes).
 const migrationBatchSize = 64
 
-// runUserMigrations walks every registered migration whose fromV is
+// runDataMigrations walks every registered migration whose fromV is
 // at or above storedV and applies them in order, advancing the
 // manifest version after each successful step. Returns the new
 // version (>= storedV).
@@ -191,8 +200,8 @@ const migrationBatchSize = 64
 // fingerprint and manifest are also rewritten to match the current
 // runtime schema — that's what tells ensureSchemaOrMigrate "the data
 // is already in the new shape, no incremental rebuild needed".
-func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint64, error) {
-	if len(b.userMigrations) == 0 || b.version == 0 {
+func (b *Bucket[T]) runDataMigrations(ctx context.Context, storedV uint64) (uint64, error) {
+	if len(b.dataMigrations) == 0 || b.version == 0 {
 		return storedV, nil
 	}
 	if storedV >= b.version {
@@ -218,14 +227,14 @@ func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint
 
 	// Sort by fromV so chained migrations apply in order regardless
 	// of registration sequence.
-	steps := append([]userMigration(nil), b.userMigrations...)
+	steps := append([]dataMigration(nil), b.dataMigrations...)
 	sort.Slice(steps, func(i, j int) bool { return steps[i].fromV < steps[j].fromV })
 
 	current := storedV
 	for current < b.version {
 		// Find the migration that starts at current.
 		var (
-			step userMigration
+			step dataMigration
 			ok   bool
 		)
 		for _, s := range steps {
@@ -243,14 +252,11 @@ func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint
 			return current, fmt.Errorf("bw: migration v%d->v%d is not forward", step.fromV, step.toV)
 		}
 
+		// runMigrationStep clears the resume cursor and records the new
+		// version together, so a completed step is never observable as
+		// "finished but not recorded".
 		if err := b.runMigrationStep(ctx, step); err != nil {
 			return current, err
-		}
-
-		// Persist the new version atomically; resume key has
-		// already been cleared by runMigrationStep on success.
-		if err := b.bumpStoredVersion(step.toV); err != nil {
-			return current, fmt.Errorf("bw: bump version after migration v%d->v%d: %w", step.fromV, step.toV, err)
 		}
 		current = step.toV
 	}
@@ -258,7 +264,7 @@ func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint
 	// Chain done — the data is now in the schema's current shape.
 	// Update the persisted fingerprint + manifest so subsequent
 	// opens take the fast (no-op) ensureSchemaOrMigrate path.
-	if err := b.finalizeUserMigration(); err != nil {
+	if err := b.finalizeDataMigration(); err != nil {
 		return current, fmt.Errorf("bw: finalize migration: %w", err)
 	}
 	return current, nil
@@ -268,7 +274,7 @@ func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint
 // record in the bucket. Resumable: a progress key remembers the last
 // successfully processed pk, and a crashed run picks up from the
 // next pk on restart.
-func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) error {
+func (b *Bucket[T]) runMigrationStep(ctx context.Context, step dataMigration) error {
 	prefix := dataPrefix(b.name)
 
 	progKey := migProgressKey(b.name, step.fromV, step.toV)
@@ -297,7 +303,7 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 		return err
 	}
 
-	slog.Info("bw: user migration starting",
+	slog.Info("bw: data migration starting",
 		"bucket", b.name, "fromV", step.fromV, "toV", step.toV,
 		"total", total, "resume_from", fmt.Sprintf("%x", resumePK))
 
@@ -377,9 +383,26 @@ func (b *Bucket[T]) runMigrationStep(ctx context.Context, step userMigration) er
 		b.migrationProgress(b.name, step.fromV, step.toV, processed, total)
 	}
 
-	// Drop the resume key — step done.
+	// Drop the resume cursor and record the new version in one
+	// transaction.
+	//
+	// Doing them separately leaves a window in which a crash clears the
+	// cursor but not the version, so the next open replays the step from
+	// the first record. For a migration that only adds information that
+	// is a slow no-op, but a migration that moves data out of the record
+	// — an embedding relocated to its own keyspace, say — would replay
+	// against records that no longer carry what it reads, and write back
+	// the absence. The window is small and the damage is silent, which is
+	// the worst combination to leave in place.
 	return b.db.bdb.Update(func(btx *badger.Txn) error {
-		return btx.Delete(progKey)
+		if err := btx.Delete(progKey); err != nil {
+			return err
+		}
+
+		var buf [8]byte
+		bigEndianPutUint64(buf[:], step.toV)
+
+		return btx.Set(versionKey(b.name), buf[:])
 	})
 }
 
@@ -463,7 +486,7 @@ func (b *Bucket[T]) collectMigrationBatch(prefix, resumePK []byte, batchSize int
 // indexes, FTS postings and the vector graph stay in sync — the user
 // migration is at heart "rewrite this record", and rewrites should
 // look just like ordinary writes.
-func (b *Bucket[T]) applyMigrationBatch(ctx context.Context, step userMigration, batch []migrationRecord) error {
+func (b *Bucket[T]) applyMigrationBatch(ctx context.Context, step dataMigration, batch []migrationRecord) error {
 	return b.db.Update(func(tx *Tx) error {
 		for _, r := range batch {
 			newRaw, err := step.apply(ctx, r.raw)
@@ -514,25 +537,13 @@ func (b *Bucket[T]) writeMigrationResume(progKey, pk []byte) error {
 	})
 }
 
-// bumpStoredVersion writes the new version into the bucket's manifest
-// version key. Mirrors the schema-migration version write but kept
-// separate so user migrations don't accidentally overwrite the
-// fingerprint or other meta.
-func (b *Bucket[T]) bumpStoredVersion(newV uint64) error {
-	return b.db.bdb.Update(func(btx *badger.Txn) error {
-		var buf [8]byte
-		bigEndianPutUint64(buf[:], newV)
-		return btx.Set(versionKey(b.name), buf[:])
-	})
-}
-
-// finalizeUserMigration writes the new schema fingerprint and manifest
+// finalizeDataMigration writes the new schema fingerprint and manifest
 // in a single Badger transaction. Called once a chain of user
 // migrations has run to completion: the data is now in the new shape,
 // so the persisted schema metadata should reflect that. Without this
 // the next ensureSchemaOrMigrate would refuse the bucket on the
 // "fingerprint mismatch + version not bumped" check.
-func (b *Bucket[T]) finalizeUserMigration() error {
+func (b *Bucket[T]) finalizeDataMigration() error {
 	want := b.schema.Fingerprint()
 	wantManifest, err := json.Marshal(buildManifest(b.schema))
 	if err != nil {
