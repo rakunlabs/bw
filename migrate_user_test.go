@@ -449,3 +449,106 @@ func TestUserMigration_Progress(t *testing.T) {
 		t.Fatalf("last processed = %d, want %d", lastProcessed, N)
 	}
 }
+
+// TestUserMigration_FreshBucketSkipsChain covers registering a versioned
+// bucket that has never existed before.
+//
+// A new database has no records, so there is nothing for a migration to
+// transform — but the stored version reads back as 0, which used to send the
+// runner looking for a step starting at 0 and fail registration outright. The
+// effect was that no fresh deployment could use WithVersion together with any
+// migration, which is exactly the combination a schema that has evolved once
+// will have.
+func TestUserMigration_FreshBucketSkipsChain(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := bw.Open(t.TempDir(), bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	migrated := false
+
+	b, err := bw.RegisterBucket[userV3](db, "users",
+		bw.WithVersion[userV3](3),
+		bw.WithTypedMigration(2, 3, func(_ context.Context, old *userV2) (*userV3, error) {
+			migrated = true
+
+			return &userV3{ID: old.ID, First: old.First, Last: old.Last}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("registering a fresh versioned bucket with a migration: %v", err)
+	}
+
+	if migrated {
+		t.Fatal("the migration ran against a bucket that has never held a record")
+	}
+
+	// The bucket is usable and lands at the current version, so a later open
+	// does not try to migrate it either.
+	if err := b.Insert(ctx, &userV3{ID: "a", First: "Ali", Last: "Veli", Email: "ali.veli@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := b.Get(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Email != "ali.veli@example.com" {
+		t.Fatalf("Email = %q", got.Email)
+	}
+}
+
+// TestUserMigration_ExistingBucketStillMigrates is the other side of the
+// fresh-bucket check: a bucket that does hold records must still run its
+// chain, so the fix cannot be "never migrate when the version is 0".
+func TestUserMigration_ExistingBucketStillMigrates(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	db1, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, err := bw.RegisterBucket[userV2](db1, "users", bw.WithVersion[userV2](2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Insert(ctx, &userV2{ID: "a", First: "Ali", Last: "Veli"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	b2, err := bw.RegisterBucket[userV3](db2, "users",
+		bw.WithVersion[userV3](3),
+		bw.WithTypedMigration(2, 3, func(_ context.Context, old *userV2) (*userV3, error) {
+			return &userV3{
+				ID:    old.ID,
+				First: old.First,
+				Last:  old.Last,
+				Email: strings.ToLower(old.First + "." + old.Last + "@example.com"),
+			}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := b2.Get(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Email != "ali.veli@example.com" {
+		t.Fatalf("Email = %q, want the migration to have filled it", got.Email)
+	}
+}

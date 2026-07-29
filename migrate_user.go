@@ -191,6 +191,23 @@ func (b *Bucket[T]) runUserMigrations(ctx context.Context, storedV uint64) (uint
 		return storedV, nil
 	}
 
+	// A bucket being registered for the first time has no records, so there is
+	// nothing to migrate — it is simply created at the current version.
+	//
+	// Without this check a brand-new database could not use WithVersion(N)
+	// together with any migration at all: the stored version reads back as 0,
+	// the chain looks for a step starting at 0, and registration fails on a
+	// bucket that has never held a single record. The absence of a stored
+	// fingerprint is what distinguishes "never registered" from "registered
+	// before versioning existed", and the latter still needs its 0->N step.
+	fingerprint, err := b.db.readSchemaFingerprint(b.name)
+	if err != nil {
+		return storedV, err
+	}
+	if fingerprint == "" {
+		return storedV, nil
+	}
+
 	// Sort by fromV so chained migrations apply in order regardless
 	// of registration sequence.
 	steps := append([]userMigration(nil), b.userMigrations...)
