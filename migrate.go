@@ -53,6 +53,9 @@ func MigrateBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucket
 	for _, o := range opts {
 		o(b)
 	}
+	if err := b.prepareDataMigrations(); err != nil {
+		return nil, err
+	}
 	storedFingerprint, err := db.readSchemaFingerprint(name)
 	if err != nil {
 		return nil, err

@@ -75,7 +75,6 @@ func main() {
 	defer db.Close()
 
 	users, err := bw.RegisterBucket[UserV2](db, "users",
-		bw.WithVersion[UserV2](2),
 		bw.WithTypedMigration[UserV1, UserV2](1, 2,
 			func(_ context.Context, old *UserV1) (*UserV2, error) {
 				// "First Last" → split on the first whitespace.
@@ -111,7 +110,6 @@ func main() {
 	// Re-running RegisterBucket at v2 is a no-op — the migration
 	// already completed and the bucket version is now 2.
 	_, err = bw.RegisterBucket[UserV2](db, "users",
-		bw.WithVersion[UserV2](2),
 		bw.WithTypedMigration[UserV1, UserV2](1, 2,
 			func(_ context.Context, _ *UserV1) (*UserV2, error) {
 				log.Fatal("migration unexpectedly re-ran")

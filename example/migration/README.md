@@ -18,15 +18,48 @@ go run ./example/migration
 1. **Insert under v1.** A `UserV1` struct with a single `Name` field
    is registered at `WithVersion(1)`. Three users are inserted.
 2. **Reopen as v2.** The bucket type changes to `UserV2` (split into
-   `First` and `Last`, with `First` indexed) and `WithVersion(2)` is
-   set. A `WithTypedMigration[UserV1, UserV2](1, 2, fn)` describes
-   how to convert one shape into the other. bw walks every record,
-   runs the callback, and writes the result back through the
-   ordinary `Insert` path so secondary indexes stay coherent. A
-   progress hook reports how many records have been processed.
+   `First` and `Last`, with `First` indexed). A
+   `WithTypedMigration[UserV1, UserV2](1, 2, fn)` describes how to
+   convert one shape into the other and automatically makes `2` the
+   target version; there is no duplicate `WithVersion(2)` to keep in
+   sync. bw walks every record, runs the callback, and writes the
+   result back through the ordinary `Insert` path so secondary
+   indexes stay coherent. A progress hook reports how many records
+   have been processed.
 3. **Verify.** The same bucket handle now reads `UserV2` records.
    Re-running `RegisterBucket` at v2 is a no-op — the migration is
    idempotent because the persisted version key already says `2`.
+
+When deployments may skip releases, keep every migration step registered. A
+database at v3 can reach v6 through `3->4`, `4->5`, and `5->6` (or through one
+explicit `3->6` migration). bw validates the complete path before changing the
+first record, so a missing intermediate step fails without leaving the bucket
+half-upgraded.
+
+## Schema-only vs data migration
+
+Do not write a record callback when only the model metadata changes. For
+example, adding a field whose zero value is acceptable or changing an
+index/unique tag only needs a version bump:
+
+```go
+bw.RegisterBucket[UserV6](db, "users", bw.WithVersion[UserV6](6))
+```
+
+With no data migration options, this can move directly from stored v3 to v6;
+no `3->4`, `4->5`, or `5->6` callbacks are required. Existing records are not
+rewritten.
+
+Use a data migration when existing encoded values must change: renaming a
+serialized `bw` field, changing a field type, splitting/merging fields,
+backfilling values, or recomputing embeddings.
+
+If schema-only and data-changing releases are mixed, a missing data step is
+not assumed to be a no-op. Register a complete conversion path for every
+stored version that may still exist. For a `3->4` data change, schema-only
+`4->5`, and a `5->6` data change, a v6 binary can register `3->4`, `4->6`, and
+`5->6`. This lets v3 follow `3->4->6` while v4 and v5 each have a direct path,
+without an identity migration that rewrites all records.
 
 ## Other migration shapes
 

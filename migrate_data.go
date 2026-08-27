@@ -22,11 +22,12 @@ import (
 // with the previous type and read the data as if nothing had been
 // attempted.
 //
-// Each migration is bound to a (fromVersion, toVersion) pair. When
-// RegisterBucket sees that the stored bucket version is below the
-// requested WithVersion, it walks every registered migration whose
-// fromVersion equals the stored version, applies it, advances the
-// stored version, and repeats — chaining 1→2→3 in order.
+// Each migration is bound to a (fromVersion, toVersion) pair. The highest
+// registered toVersion becomes the bucket's target version automatically, so
+// callers do not also have to keep WithVersion in sync. RegisterBucket walks
+// every registered migration whose fromVersion equals the stored version,
+// applies it, advances the stored version, and repeats — chaining 1→2→3 in
+// order.
 //
 // Three flavours of migration are supplied for ergonomics:
 //
@@ -77,9 +78,10 @@ type dataMigration struct {
 // fromVersion to toVersion. fn is invoked once per record in the
 // bucket; the returned bytes replace the record in place.
 //
-// The migration runs inside RegisterBucket when stored bucket version
-// equals fromVersion. Multiple migrations can be chained by calling
-// WithRawMigration repeatedly with consecutive (fromV, toV) pairs.
+// The migration runs inside RegisterBucket when stored bucket version equals
+// fromVersion. Multiple migrations can be chained by calling WithRawMigration
+// repeatedly with consecutive (fromV, toV) pairs. The greatest toVersion is
+// used as the bucket version; a separate WithVersion is unnecessary.
 func WithRawMigration[T any](fromV, toV uint64, fn RawMigrationFn) BucketOption[T] {
 	return func(b *Bucket[T]) {
 		b.dataMigrations = append(b.dataMigrations, dataMigration{
@@ -185,6 +187,58 @@ func WithMigrationProgress[T any](fn MigrationProgress) BucketOption[T] {
 // Runner
 // ---------------------------------------------------------------------------
 
+// prepareDataMigrations validates definitions that do not depend on the
+// version stored on disk and makes the migration list the source of truth for
+// its target version. It runs after all BucketOptions so option ordering does
+// not matter and a forgotten stale WithVersion cannot hold the target back.
+func (b *Bucket[T]) prepareDataMigrations() error {
+	toByFrom := make(map[uint64]uint64, len(b.dataMigrations))
+	for _, step := range b.dataMigrations {
+		if step.apply == nil {
+			return fmt.Errorf("bw: migration v%d->v%d has a nil function", step.fromV, step.toV)
+		}
+		if step.toV <= step.fromV {
+			return fmt.Errorf("bw: migration v%d->v%d is not forward", step.fromV, step.toV)
+		}
+		if existing, ok := toByFrom[step.fromV]; ok {
+			return fmt.Errorf("bw: ambiguous migrations from version %d to both %d and %d", step.fromV, existing, step.toV)
+		}
+		toByFrom[step.fromV] = step.toV
+		if step.toV > b.version {
+			b.version = step.toV
+		}
+	}
+
+	return nil
+}
+
+// planDataMigrations resolves the complete storedV->target path before any
+// callback runs. A missing intermediate migration is therefore a
+// configuration error, not a partially applied upgrade.
+func (b *Bucket[T]) planDataMigrations(storedV uint64) ([]dataMigration, error) {
+	steps := append([]dataMigration(nil), b.dataMigrations...)
+	sort.Slice(steps, func(i, j int) bool { return steps[i].fromV < steps[j].fromV })
+
+	byFrom := make(map[uint64]dataMigration, len(steps))
+	for _, step := range steps {
+		byFrom[step.fromV] = step
+	}
+
+	current := storedV
+	plan := make([]dataMigration, 0, len(steps))
+	for current < b.version {
+		step, ok := byFrom[current]
+		if !ok {
+			return nil, fmt.Errorf("bw: no migration registered for bucket %q version %d -> %d (chain stops at %d)",
+				b.name, storedV, b.version, current)
+		}
+		plan = append(plan, step)
+		current = step.toV
+	}
+
+	return plan, nil
+}
+
 // migrationBatchSize is the number of records processed per Badger
 // transaction. Tuned to stay well below MaxBatchCount for the typical
 // secondary-index / FTS write fan-out (a record with a few indexes
@@ -225,33 +279,13 @@ func (b *Bucket[T]) runDataMigrations(ctx context.Context, storedV uint64) (uint
 		return storedV, nil
 	}
 
-	// Sort by fromV so chained migrations apply in order regardless
-	// of registration sequence.
-	steps := append([]dataMigration(nil), b.dataMigrations...)
-	sort.Slice(steps, func(i, j int) bool { return steps[i].fromV < steps[j].fromV })
+	plan, err := b.planDataMigrations(storedV)
+	if err != nil {
+		return storedV, err
+	}
 
 	current := storedV
-	for current < b.version {
-		// Find the migration that starts at current.
-		var (
-			step dataMigration
-			ok   bool
-		)
-		for _, s := range steps {
-			if s.fromV == current {
-				step = s
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return current, fmt.Errorf("bw: no migration registered for bucket %q version %d -> %d (chain stops at %d)",
-				b.name, current, b.version, current)
-		}
-		if step.toV <= step.fromV {
-			return current, fmt.Errorf("bw: migration v%d->v%d is not forward", step.fromV, step.toV)
-		}
-
+	for _, step := range plan {
 		// runMigrationStep clears the resume cursor and records the new
 		// version together, so a completed step is never observable as
 		// "finished but not recorded".

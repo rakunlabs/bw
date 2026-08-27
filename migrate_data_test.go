@@ -70,7 +70,6 @@ func TestDataMigration_TypedSingleStep(t *testing.T) {
 	}
 	defer db2.Close()
 	b2, err := bw.RegisterBucket[userV2](db2, "users",
-		bw.WithVersion[userV2](2),
 		bw.WithTypedMigration[userV1, userV2](1, 2, func(_ context.Context, old *userV1) (*userV2, error) {
 			parts := strings.SplitN(old.Name, " ", 2)
 			first, last := parts[0], ""
@@ -104,7 +103,6 @@ func TestDataMigration_TypedSingleStep(t *testing.T) {
 	// Re-opening with the same version should be a no-op (no
 	// migration re-run, no errors).
 	if _, err := bw.RegisterBucket[userV2](db2, "users",
-		bw.WithVersion[userV2](2),
 		bw.WithTypedMigration[userV1, userV2](1, 2, func(_ context.Context, _ *userV1) (*userV2, error) {
 			t.Fatalf("migration should not re-run on stable version")
 			return nil, nil
@@ -160,6 +158,65 @@ func TestDataMigration_TypedMultiStep(t *testing.T) {
 	}
 	if got.First != "Ali" || got.Last != "Veli" || got.Email != "ali.veli@example.com" {
 		t.Fatalf("chained migration: %+v", got)
+	}
+}
+
+// TestDataMigration_InfersVersionAcrossSkippedReleases keeps the migration
+// list as the source of truth for the target version. This covers both a
+// forgotten WithVersion bump and an application jumping directly from v3 to
+// v6 without running the intermediate releases.
+func TestDataMigration_InfersVersionAcrossSkippedReleases(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	db1, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b3, err := bw.RegisterBucket[userV1](db1, "users_skip", bw.WithVersion[userV1](3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b3.Insert(ctx, &userV1{ID: "1", Name: "v3"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	b6, err := bw.RegisterBucket[userV1](db2, "users_skip",
+		// Intentionally stale and intentionally last: migration definitions
+		// must win regardless of BucketOption ordering.
+		bw.WithTypedMigration[userV1, userV1](5, 6, func(_ context.Context, old *userV1) (*userV1, error) {
+			old.Name += "->v6"
+			return old, nil
+		}),
+		bw.WithTypedMigration[userV1, userV1](3, 4, func(_ context.Context, old *userV1) (*userV1, error) {
+			old.Name += "->v4"
+			return old, nil
+		}),
+		bw.WithTypedMigration[userV1, userV1](4, 5, func(_ context.Context, old *userV1) (*userV1, error) {
+			old.Name += "->v5"
+			return old, nil
+		}),
+		bw.WithVersion[userV1](3),
+	)
+	if err != nil {
+		t.Fatalf("register v6 with stale WithVersion: %v", err)
+	}
+
+	got, err := b6.Get(ctx, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "v3->v4->v5->v6" {
+		t.Fatalf("Name = %q, want chained v3->v6 result", got.Name)
 	}
 }
 
@@ -229,6 +286,62 @@ func TestDataMigration_MissingStep(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no migration registered") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestDataMigration_MissingLateStepDoesNotPartiallyUpgrade verifies that the
+// whole chain is checked before the first callback. Configuration mistakes
+// should not move a bucket to an intermediate version before failing.
+func TestDataMigration_MissingLateStepDoesNotPartiallyUpgrade(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	db1, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, err := bw.RegisterBucket[userV1](db1, "users_late_gap", bw.WithVersion[userV1](1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Insert(ctx, &userV1{ID: "1", Name: "Ali"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := bw.Open(dir, bw.WithLogger(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	called := false
+	_, err = bw.RegisterBucket[userV3](db2, "users_late_gap",
+		bw.WithVersion[userV3](3),
+		bw.WithTypedMigration[userV1, userV3](1, 2, func(_ context.Context, old *userV1) (*userV3, error) {
+			called = true
+			return &userV3{ID: old.ID, First: old.Name}, nil
+		}),
+	)
+	if err == nil || !strings.Contains(err.Error(), "chain stops at 2") {
+		t.Fatalf("expected missing 2->3 error, got %v", err)
+	}
+	if called {
+		t.Fatal("the 1->2 migration ran before the missing 2->3 step was detected")
+	}
+
+	old, err := bw.RegisterBucket[userV1](db2, "users_late_gap", bw.WithVersion[userV1](1))
+	if err != nil {
+		t.Fatalf("re-register unchanged v1 after rejected plan: %v", err)
+	}
+	got, err := old.Get(ctx, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "Ali" {
+		t.Fatalf("record changed after rejected plan: %+v", got)
 	}
 }
 

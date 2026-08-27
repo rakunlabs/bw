@@ -126,7 +126,8 @@ repeat as long as the full tuple is distinct:
 
 ### Schema evolution (adding/removing fields)
 
-When you change a struct (add new fields, add/remove indexes), use
+When you change a struct without changing existing record values (add a field
+whose zero value is acceptable, remove a field, or add/remove an index), use
 `WithVersion` to tell `RegisterBucket` to auto-migrate:
 
 ```go
@@ -146,7 +147,7 @@ type User struct {
 ```
 
 ```go
-// Bump the version number each time you change the index/unique surface.
+// Bump the version number for schema-only changes.
 // RegisterBucket auto-migrates when stored version < provided version.
 users, err := bw.RegisterBucket[User](db, "users", bw.WithVersion[User](2))
 if err != nil {
@@ -181,6 +182,84 @@ schema against the new one and only touches what changed:
 - If you don't provide `WithVersion`, the old strict behavior applies
   (fingerprint mismatch = error). You can still call `MigrateBucket`
   explicitly in that case.
+- Data migrations (`WithTypedMigration`, `WithRawMigration`, and
+  `WithVectorReembed`) automatically use their greatest `toVersion` as the
+  bucket version. Do not duplicate that target with `WithVersion`; retain all
+  intermediate steps so skipped deployments (for example v3 directly to v6)
+  have a complete path.
+
+#### Choosing a migration option
+
+Schema migration and data migration solve different problems. A schema
+migration reconciles metadata and indexes while leaving encoded records alone.
+A data migration decodes and rewrites every existing record.
+
+| Change | Use | Existing records |
+| --- | --- | --- |
+| Add a field whose zero value is acceptable | `WithVersion` | Not rewritten; the new field decodes to its zero value |
+| Remove a field | `WithVersion` | Not rewritten; the removed value is ignored when decoding |
+| Add/remove `index` or `unique` | `WithVersion` | Data values stay unchanged; affected index keys are reconciled |
+| Rename a Go field but keep the same `bw` name and type | Nothing | Wire shape is unchanged |
+| Rename a serialized `bw` field and preserve its value | `WithTypedMigration` | Rewritten into the new field |
+| Change a field type, split/merge fields, or backfill a value | `WithTypedMigration` | Decoded as the old type and rewritten as the new type |
+| Make a small map-style edit without retaining an old struct | `WithRawMigration` | Raw encoded value is transformed and rewritten |
+| Recompute embeddings | `WithVectorReembed` | Records and the vector index are rebuilt with new embeddings |
+| Report batch progress | `WithMigrationProgress` | Does not change migration semantics |
+| Explicitly reconcile a schema without version tracking | `MigrateBucket` | Performs the incremental schema migration directly |
+
+For a schema-only jump, intermediate releases do not need callbacks. A database
+at v3 can open the v6 model directly:
+
+```go
+users, err := bw.RegisterBucket[UserV6](db, "users",
+    bw.WithVersion[UserV6](6),
+)
+```
+
+Because no data migration is registered, bw reconciles the final schema and
+advances the stored version from 3 to 6. It does not look for `3->4`, `4->5`,
+or `5->6` data steps.
+
+#### Data chains and skipped releases
+
+Once any data migration is registered, every database version that may exist
+in production must have a complete path to the target. bw validates that path
+before invoking the first callback. It deliberately does not treat a missing
+step as a no-op because the step may have been forgotten.
+
+Consecutive steps work as expected:
+
+```go
+bw.WithTypedMigration[UserV3, UserV6](3, 4, migrateV3ToCurrentShape),
+bw.WithTypedMigration[UserV4, UserV6](4, 5, migrateV4ToCurrentShape),
+bw.WithTypedMigration[UserV5, UserV6](5, 6, migrateV5ToCurrentShape),
+```
+
+All typed options must return the current bucket type (`UserV6` here).
+Intermediate callbacks populate the fields available at that step and leave
+fields introduced by later steps at their zero value; the following callback
+decodes that result through its corresponding old type.
+
+Direct jumps are also valid when the callback handles the whole conversion:
+
+```go
+bw.WithTypedMigration[UserV3, UserV6](3, 6, migrateV3ToV6),
+```
+
+For a mixed history such as `3->4` (data), `4->5` (schema only), and `5->6`
+(data), do not add an identity raw migration just to fill `4->5`; that would
+rewrite every record unnecessarily. Register conversion paths for each stored
+version that a deployment may encounter:
+
+```go
+bw.WithTypedMigration[UserV3, UserV6](3, 4, migrateV3ToCurrentShape),
+bw.WithTypedMigration[UserV4, UserV6](4, 6, migrateV4ToCurrentShape),
+bw.WithTypedMigration[UserV5, UserV6](5, 6, migrateV5ToCurrentShape),
+```
+
+Here a v3 database follows `3->4->6`, while databases already at v4 or v5 use
+their corresponding direct path. Keep old migration definitions in the
+registration options for as long as those stored versions can still exist.
 
 ### Defaults
 

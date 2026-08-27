@@ -46,9 +46,10 @@ type Bucket[T any] struct {
 	// handed to the query planner.
 	compositeQueryFields []engine.CompositeIndexedField
 
-	// version is the caller-supplied schema version. When set (>0) and
-	// higher than the stored version, RegisterBucket auto-migrates
-	// instead of returning a fingerprint mismatch error.
+	// version is the schema version requested by WithVersion or inferred
+	// from the highest toVersion in the registered data migrations. When
+	// higher than the stored version, RegisterBucket auto-migrates instead
+	// of returning a fingerprint mismatch error.
 	version uint64
 
 	// ftsIdx is the full-text search index for this bucket, or nil when
@@ -97,12 +98,16 @@ func WithKeyFn[T any](fn func(*T) ([]byte, error)) BucketOption[T] {
 	return func(b *Bucket[T]) { b.keyFn = fn }
 }
 
-// WithVersion sets the schema version for this bucket. When the stored
-// version is lower than the provided one, RegisterBucket automatically
-// performs an incremental migration (only rebuilding indexes for changed
-// fields) instead of failing with a fingerprint mismatch.
+// WithVersion sets the schema version for this bucket. When the stored version
+// is lower than the provided one, RegisterBucket automatically performs an
+// incremental schema migration instead of failing with a fingerprint
+// mismatch. Existing records are not rewritten; newly added fields therefore
+// decode to their zero value, while changed indexes are reconciled.
 //
-// Bump this number each time you change the struct's index/unique surface.
+// Use this for schema-only changes. When record values must be transformed,
+// register a typed, raw, or vector migration instead; its highest toVersion
+// automatically raises this value, so WithVersion does not need to duplicate
+// the data migration target.
 func WithVersion[T any](v uint64) BucketOption[T] {
 	return func(b *Bucket[T]) { b.version = v }
 }
@@ -182,6 +187,9 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 	}
 	for _, o := range opts {
 		o(b)
+	}
+	if err := b.prepareDataMigrations(); err != nil {
+		return nil, err
 	}
 	storedFingerprint, err := db.readSchemaFingerprint(name)
 	if err != nil {
