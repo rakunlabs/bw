@@ -46,6 +46,11 @@ type Field struct {
 	// FTS is true if a full-text search index should be maintained on
 	// this field (only string fields are supported).
 	FTS bool
+	// Trigram is true if a byte-trigram index should be maintained on
+	// this field (only string fields are supported). It backs regular
+	// expression search: the index narrows the candidate documents, the
+	// regexp itself decides which of them actually match.
+	Trigram bool
 	// Vector is true if a vector index should be maintained on this
 	// field (only []float32 is supported).
 	Vector bool
@@ -130,6 +135,9 @@ func (s *Schema) Fingerprint() string {
 		if f.FTS {
 			flags += "F"
 		}
+		if f.Trigram {
+			flags += "G"
+		}
 		if f.Vector {
 			flags += "V"
 			if f.VectorDim > 0 {
@@ -181,6 +189,18 @@ func (s *Schema) FTSFields() []*Field {
 	out := make([]*Field, 0)
 	for _, f := range s.Fields {
 		if f.FTS {
+			out = append(out, f)
+		}
+	}
+
+	return out
+}
+
+// TrigramFields returns the subset of Fields tagged with `trigram`.
+func (s *Schema) TrigramFields() []*Field {
+	out := make([]*Field, 0)
+	for _, f := range s.Fields {
+		if f.Trigram {
 			out = append(out, f)
 		}
 	}
@@ -357,6 +377,8 @@ func walkStruct(t reflect.Type, indexPrefix []int, s *Schema) error {
 					f.UniqueGroup = strings.TrimPrefix(flag, "unique:")
 				case flag == "fts":
 					f.FTS = true
+				case flag == "trigram":
+					f.Trigram = true
 				case flag == "vector":
 					f.Vector = true
 				case strings.HasPrefix(flag, "vector(") && strings.HasSuffix(flag, ")"):

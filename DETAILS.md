@@ -95,6 +95,11 @@ data:    <bucket>\x00<pk>                                       → encoded reco
 index:   \x00idx\x00<bucket>\x00<field>\x00<lp(value)><pk>      → empty
 unique:  \x00uniq\x00<bucket>\x00<field>\x00<value>             → pk
 meta:    \x00meta\x00<bucket>                                   → schema fingerprint
+fts:     \x00fts\x00<bucket>\x00…                               → BM25 postings, doc lengths, corpus stats
+trigram: \x00tri\x00<bucket>\x00p\x00<field>\x00<tri:3><id:4>   → empty
+         \x00tri\x00<bucket>\x00i\x00<pk>                       → interned document id
+         \x00tri\x00<bucket>\x00r\x00<id:4>                     → primary key
+         \x00tri\x00<bucket>\x00f\x00<field>\x00<id:4>           → field-indexed marker
 ```
 
 - `\x00` separators keep prefix scans cheap.
@@ -120,6 +125,106 @@ changes neither the index keyspace nor the vector keyspace, only how much
 of a record the encoder writes from that point on. Flipping it is
 forward-only — records written before the change keep their inline copy
 until they are rewritten.
+
+---
+
+## Regular-expression search
+
+A `trigram`-tagged string field carries a byte-trigram index that turns a
+regular expression into a candidate set. `RegexSearch` / `RegexWalk` then
+run the compiled regexp over each candidate's stored value: the index only
+removes reading, it never decides a match, so the answer is exactly what a
+linear scan would have produced.
+
+```go
+type Chunk struct {
+    ID      string `bw:"id,pk"`
+    Repo    string `bw:"repo,index"`
+    Snippet string `bw:"snippet,fts,trigram"`
+}
+
+hits, total, err := chunks.RegexSearch(ctx, `func \(m \*Manager\)`, bw.RegexOptions{
+    CaseSensitive: true,
+    KeyFilter:     func(id string) bool { return strings.HasPrefix(id, "acme/app/") },
+})
+```
+
+### Planning
+
+`regexTrigramQuery` walks the parsed `regexp/syntax` tree and returns a
+boolean expression over trigrams that every match must satisfy. Literals
+contribute their trigrams; adjacent literals inside a concatenation are
+merged first, which is what makes `errors\.Is\(` selective even though the
+parser splits it into four atoms. Alternation becomes a disjunction, `+`
+and `{n,}` with `n ≥ 1` pass through to their operand, and everything else
+— character classes, `*`, `?`, anchors — widens to "no constraint".
+
+Widening is always safe: a pattern the planner cannot constrain costs a
+scan of the bucket, never a wrong answer. That is also the escape hatch
+for a pattern with no three-byte literal run at all (`ab.cd`, `[a-z]+`).
+
+### Case folding
+
+Trigrams are folded per byte over ASCII on both the write and the query
+side. Folding per byte rather than per rune is what keeps a trigram
+exactly three bytes, which is what makes the posting key fixed-width. The
+consequence is that case-sensitive and case-insensitive searches share one
+index and cost the same — only the compiled regexp differs. A
+case-*insensitive* literal containing a non-ASCII rune is the one shape
+the planner refuses to constrain, because Unicode folding does not
+preserve byte length.
+
+### Document ids
+
+A posting names a 4-byte interned document id, not the primary key. A code
+chunk emits on the order of a thousand trigrams, so the posting key *is*
+the index's cost: interning makes consecutive postings under one trigram
+differ only in their last four bytes, which is what lets Badger's
+per-block key diffing store each in a handful of bytes. The pk↔id tables
+outlive a document's deletion so re-indexing the same pk reuses its id —
+the normal shape for a refresh that deletes and rewrites a corpus.
+
+A write diffs the record's new trigrams against its previous ones, which is
+only correct against a term set that was actually written — so the index
+keeps one marker key per (document, tagged field) recording that the field
+has postings. Indexedness cannot be per document: a bucket that gains the
+`trigram` tag on a *second* field would rewrite each record, find the
+document already interned, diff the second field's unchanged value against
+itself, and leave that field permanently unsearchable with no error. One
+marker beside a thousand postings does not move the size story.
+
+### Intersection
+
+An AND is answered by materialising the *rarest* trigram's posting list
+and point-reading the others for each candidate. Rarity comes from a
+capped probe (512 keys): the exact length of a long posting list cannot
+change the choice, and walking it to find out would cost more than the
+plan saves. At most eight trigrams are verified per candidate; dropping
+the rest only admits false candidates, which the regexp rejects.
+
+Beyond `MaxCandidates` (250 000 by default) the prefilter stops paying for
+itself and the search falls back to a bucket scan — the same reasoning as
+the vector index's brute-force threshold.
+
+### Cost
+
+Measured over 1.9 MiB of Go source (the krabby repository) chunked the way
+a code index chunks it, the trigram keyspace adds this much LSM:
+
+| chunk size | added index | ratio to source |
+| --- | --- | --- |
+| 3 000 chars | 8.9 MiB | 4.5× |
+| 12 000 chars | 5.6 MiB | 2.9× |
+
+The ratio is driven by document granularity, not by the corpus: the number
+of *distinct* trigrams in a document grows far more slowly than its size,
+so a posting amortises over more source bytes the larger the document is.
+A 3 000-character chunk holds roughly one posting per two source bytes.
+Chunk larger when index size matters more than match locality.
+
+Trigram writes also dominate a record's transaction footprint — a chunk
+expands into ~1 500 keys — so a writer batching records should be prepared
+to halve on `ErrTxnTooBig` rather than assume a fixed batch size.
 
 ---
 

@@ -362,6 +362,53 @@ items.0.name[like]=foo%25
 
 ---
 
+## Regular-expression search
+
+Tag a string field `trigram` and the bucket keeps a byte-trigram index
+beside the record, in the same Badger transaction as the record itself.
+`RegexSearch` uses it to pick candidates and then runs the compiled RE2
+expression over each one, so a match is decided by the regexp and never by
+the index:
+
+```go
+type Chunk struct {
+    ID      string `bw:"id,pk"`
+    Repo    string `bw:"repo,index"`
+    Snippet string `bw:"snippet,fts,trigram"`   // BM25 and regex over the same bytes
+}
+
+hits, total, err := chunks.RegexSearch(ctx, `func \(m \*Manager\)`, bw.RegexOptions{
+    CaseSensitive: true,
+    ContextLines:  0,                            // see RegexMatch for offsets and line numbers
+    KeyFilter:     func(id string) bool { return strings.HasPrefix(id, "acme/app/") },
+})
+for _, hit := range hits {
+    for _, m := range hit.Matches {
+        fmt.Println(hit.ID, m.Line, hit.Record.Snippet[m.Start:m.End])
+    }
+}
+```
+
+- Results arrive in primary-key order and `total` is exact: every
+  candidate is verified, so counting is what the search already did.
+- `KeyFilter` rejects a candidate for the cost of a function call, before
+  the record is read — the cheap way to scope a chunked or multi-tenant
+  index to one partition.
+- Case sensitivity is a regexp property, not an index property: the index
+  is ASCII-folded, so both modes cost the same.
+- A pattern with no three-byte literal run (`[a-z]+`, `ab.cd`) has nothing
+  to prefilter on and falls back to a bucket scan, which is slower but
+  returns the same answer.
+- Adding the tag to a bucket that already holds records needs a version
+  bump plus any migration step; bw routes migrations through the ordinary
+  write path, so an identity rewrite backfills the postings without
+  touching the record values.
+
+See [DETAILS.md](DETAILS.md) for the planner, the key layout and the
+measured index size.
+
+---
+
 ## Backup & restore
 
 Every `*bw.DB` exposes backup, restore and version methods backed by

@@ -24,6 +24,33 @@ import (
 // emitted (so we can decrement postings on overwrite/delete) without
 // scanning the whole posting list.
 //
+// Trigram (regular-expression prefilter) keys, same namespace and same
+// transaction:
+//
+//   tri-posting:  \x00tri\x00<bucket>\x00p\x00<field>\x00<trigram:3><docid:4>  value=nil
+//   tri-docid:    \x00tri\x00<bucket>\x00i\x00<pk>                             value=<docid:4>
+//   tri-pk:       \x00tri\x00<bucket>\x00r\x00<docid:4>                        value=<pk>
+//   tri-seq:      \x00tri\x00<bucket>\x00n\x00                                 value=<docid:4>
+//   tri-field:    \x00tri\x00<bucket>\x00f\x00<field>\x00<docid:4>             value=nil
+//
+// A trigram posting names a compact 4-byte document id rather than the
+// primary key. A code chunk emits on the order of a thousand trigrams,
+// so the per-posting key is the dominant cost of the index: interning
+// the key into a fixed-width id keeps consecutive postings under one
+// trigram differing only in their last four bytes, which is what lets
+// Badger's per-block key diffing store them in a handful of bytes each.
+// The pk<->docid tables survive a document's deletion so re-indexing
+// the same pk reuses its id.
+//
+// The tri-field marker records that one *field* of a document has been
+// indexed; it is what the update path diffs against. Indexedness cannot
+// be per-document: a record whose second trigram field only gains
+// content on a later write would have that write diffed against a
+// previous term set that was never stored, and the field's postings
+// would silently never be written. One marker per (document, tagged
+// field) is nothing beside the ~1000 postings the same document emits,
+// so it does not move the index's size story.
+//
 // All separators are a single zero byte. Field/bucket names are
 // validated at registration time to forbid embedded \x00, but record
 // PK and term values are length-prefixed with a uvarint.
@@ -37,6 +64,7 @@ var (
 	ftsPrefix  = []byte{sep, 'f', 't', 's', sep}
 	vecPrefix  = []byte{sep, 'v', 'e', 'c', sep}
 	migPrefix  = []byte{sep, 'm', 'i', 'g', sep}
+	triPrefix  = []byte{sep, 't', 'r', 'i', sep}
 )
 
 // Vector sub-namespace markers (the byte after the field name).
@@ -55,6 +83,15 @@ var (
 	ftsDoclenMark  = []byte{'d', sep}
 	ftsStatsMark   = []byte{'s', sep}
 	ftsTermsMark   = []byte{'t', sep}
+)
+
+// Trigram sub-namespace markers (the byte after the bucket name).
+var (
+	triPostingMark = []byte{'p', sep}
+	triDocIDMark   = []byte{'i', sep}
+	triPKMark      = []byte{'r', sep}
+	triSeqMark     = []byte{'n', sep}
+	triFieldMark   = []byte{'f', sep}
 )
 
 // dataPrefix returns "<bucket>\x00", the prefix used for full-bucket scans.
@@ -300,6 +337,111 @@ func parseTermsKey(key, pkPrefix []byte) (field string, term []byte, ok bool) {
 	}
 	term = rest[n : n+int(termLen)]
 	return field, term, true
+}
+
+// triBucketPrefix returns "\x00tri\x00<bucket>\x00", the namespace
+// shared by every trigram key for a bucket.
+func triBucketPrefix(bucket string) []byte {
+	out := make([]byte, 0, len(triPrefix)+len(bucket)+1)
+	out = append(out, triPrefix...)
+	out = append(out, bucket...)
+	out = append(out, sep)
+
+	return out
+}
+
+// triPostingFieldPrefix returns "\x00tri\x00<bucket>\x00p\x00<field>\x00",
+// the prefix shared by every trigram posting of (bucket, field).
+func triPostingFieldPrefix(bucket, field string) []byte {
+	bp := triBucketPrefix(bucket)
+	out := make([]byte, 0, len(bp)+len(triPostingMark)+len(field)+1)
+	out = append(out, bp...)
+	out = append(out, triPostingMark...)
+	out = append(out, field...)
+	out = append(out, sep)
+
+	return out
+}
+
+// appendTrigram appends a trigram's three bytes, most significant first,
+// so the key order of a posting list is (trigram, docid).
+func appendTrigram(dst []byte, tri uint32) []byte {
+	return append(dst, byte(tri>>16), byte(tri>>8), byte(tri))
+}
+
+// triPostingTermPrefix returns the prefix shared by every posting of one
+// trigram. The trigram is fixed-width, so no length prefix is needed.
+func triPostingTermPrefix(bucket, field string, tri uint32) []byte {
+	pfx := triPostingFieldPrefix(bucket, field)
+	out := make([]byte, 0, len(pfx)+3)
+	out = append(out, pfx...)
+
+	return appendTrigram(out, tri)
+}
+
+// triPostingKey returns the full posting key for (bucket, field, trigram, docid).
+func triPostingKey(bucket, field string, tri uint32, docID uint32) []byte {
+	pfx := triPostingTermPrefix(bucket, field, tri)
+	out := make([]byte, 0, len(pfx)+4)
+	out = append(out, pfx...)
+
+	return binary.BigEndian.AppendUint32(out, docID)
+}
+
+// docIDFromPostingKey extracts the trailing 4-byte document id of a
+// trigram posting key. termPrefix must equal triPostingTermPrefix.
+func docIDFromPostingKey(key, termPrefix []byte) (uint32, bool) {
+	if len(key) != len(termPrefix)+4 {
+		return 0, false
+	}
+
+	return binary.BigEndian.Uint32(key[len(termPrefix):]), true
+}
+
+// triDocIDKey maps a primary key to its interned document id.
+func triDocIDKey(bucket string, pk []byte) []byte {
+	bp := triBucketPrefix(bucket)
+	out := make([]byte, 0, len(bp)+len(triDocIDMark)+len(pk))
+	out = append(out, bp...)
+	out = append(out, triDocIDMark...)
+	out = append(out, pk...)
+
+	return out
+}
+
+// triPKKey maps an interned document id back to its primary key.
+func triPKKey(bucket string, docID uint32) []byte {
+	bp := triBucketPrefix(bucket)
+	out := make([]byte, 0, len(bp)+len(triPKMark)+4)
+	out = append(out, bp...)
+	out = append(out, triPKMark...)
+
+	return binary.BigEndian.AppendUint32(out, docID)
+}
+
+// triSeqKey holds the next document id to hand out for the bucket.
+func triSeqKey(bucket string) []byte {
+	bp := triBucketPrefix(bucket)
+	out := make([]byte, 0, len(bp)+len(triSeqMark))
+	out = append(out, bp...)
+	out = append(out, triSeqMark...)
+
+	return out
+}
+
+// triFieldDocKey marks (bucket, field) as indexed for one document. The
+// 'f' marker byte keeps these keys out of the posting ('p'), docid
+// ('i'), pk ('r') and sequence ('n') ranges, so a scan of either range
+// can never pick up the other's keys.
+func triFieldDocKey(bucket, field string, docID uint32) []byte {
+	bp := triBucketPrefix(bucket)
+	out := make([]byte, 0, len(bp)+len(triFieldMark)+len(field)+1+4)
+	out = append(out, bp...)
+	out = append(out, triFieldMark...)
+	out = append(out, field...)
+	out = append(out, sep)
+
+	return binary.BigEndian.AppendUint32(out, docID)
 }
 
 // vecFieldPrefix returns "\x00vec\x00<bucket>\x00<field>\x00", the

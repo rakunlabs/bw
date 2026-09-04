@@ -56,6 +56,10 @@ type Bucket[T any] struct {
 	// no FTS-tagged fields exist.
 	ftsIdx *ftsIndex
 
+	// triIdx is the trigram index for this bucket, or nil when no
+	// trigram-tagged fields exist.
+	triIdx *triIndex
+
 	// vecIdx is the vector index for this bucket, or nil when no
 	// vector-tagged field exists.
 	vecIdx *vectorIndex
@@ -261,10 +265,10 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		}
 	}
 
-	// Open the FTS / vector handles up front so data migrations
-	// (which call Insert internally) reach the full maintenance
-	// path. They're cheap config records — no I/O happens until a
-	// write fires.
+	// Open the FTS / trigram / vector handles up front so data
+	// migrations (which call Insert internally) reach the full
+	// maintenance path. They're cheap config records — no I/O happens
+	// until a write fires.
 	ftsFields := s.FTSFields()
 	if len(ftsFields) > 0 {
 		fi, err := openFTSIndex(db, name, ftsFields)
@@ -273,6 +277,14 @@ func RegisterBucket[T any](db *DB, name string, opts ...BucketOption[T]) (*Bucke
 		}
 		b.ftsIdx = fi
 		db.fts.set(name, fi)
+	}
+	triFields := s.TrigramFields()
+	if len(triFields) > 0 {
+		gi, err := openTrigramIndex(db, name, triFields)
+		if err != nil {
+			return nil, err
+		}
+		b.triIdx = gi
 	}
 	vecFields := s.VectorFields()
 	if len(vecFields) > 0 {
@@ -479,18 +491,23 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 	}
 
 	dKey := dataKey(b.name, pk)
-	if b.hasMaintenance {
+	// The old record is needed to remove index keys, and the trigram
+	// index recomputes its previous term set from it as well.
+	var old *T
+	if b.hasMaintenance || b.triIdx != nil {
 		item, gerr := tx.btx.Get(dKey)
 		switch {
 		case gerr == nil:
-			old := new(T)
+			old = new(T)
 			if err := item.Value(func(val []byte) error {
 				return b.codec.Unmarshal(val, old)
 			}); err != nil {
 				return err
 			}
-			if err := deleteIndexes(tx.btx, b.name, b.fieldEncoders, pk, old); err != nil {
-				return err
+			if b.hasMaintenance {
+				if err := deleteIndexes(tx.btx, b.name, b.fieldEncoders, pk, old); err != nil {
+					return err
+				}
 			}
 		case errors.Is(gerr, badger.ErrKeyNotFound):
 			return nil
@@ -506,6 +523,11 @@ func (b *Bucket[T]) DeleteTx(tx *Tx, key any) error {
 	if b.ftsIdx != nil {
 		if err := b.ftsIdx.deleteDoc(tx.btx, pk); err != nil {
 			return fmt.Errorf("bw: fts delete: %w", err)
+		}
+	}
+	if b.triIdx != nil {
+		if err := b.triIdx.deleteDoc(tx.btx, pk, old); err != nil {
+			return fmt.Errorf("bw: trigram delete: %w", err)
 		}
 	}
 	if b.vecIdx != nil {
@@ -545,9 +567,12 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 
 	// Maybe load the old record. We need it only when:
 	//   - the bucket has indexable fields (so we can clean up stale keys), OR
+	//   - the bucket has a trigram index (which diffs the previous term
+	//     set out of the previous value), OR
 	//   - we're in InsertNew mode (so we can refuse on existing pk).
 	var oldRecord *T
-	needRead := insertNewOnly || b.hasMaintenance
+	needDecode := b.hasMaintenance || b.triIdx != nil
+	needRead := insertNewOnly || needDecode
 	if needRead {
 		item, gerr := tx.btx.Get(dKey)
 		switch {
@@ -555,7 +580,7 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 			if insertNewOnly {
 				return ErrConflict
 			}
-			if b.hasMaintenance {
+			if needDecode {
 				oldRecord = new(T)
 				if err := item.Value(func(val []byte) error {
 					return b.codec.Unmarshal(val, oldRecord)
@@ -622,6 +647,20 @@ func (b *Bucket[T]) upsertTx(ctx context.Context, tx *Tx, record *T, insertNewOn
 	if b.ftsIdx != nil {
 		if err := b.ftsIdx.writeDoc(tx.btx, pk, record); err != nil {
 			return fmt.Errorf("bw: fts write: %w", err)
+		}
+	}
+
+	// Trigram postings, same atomicity story. The previous record is
+	// passed so only the terms that actually changed are touched: a
+	// rewrite that edits one line of a chunk moves a handful of keys
+	// instead of the chunk's whole term set.
+	if b.triIdx != nil {
+		var oldAny any
+		if oldRecord != nil {
+			oldAny = oldRecord
+		}
+		if err := b.triIdx.writeDoc(tx.btx, pk, oldAny, record); err != nil {
+			return fmt.Errorf("bw: trigram write: %w", err)
 		}
 	}
 
@@ -720,48 +759,10 @@ func (b *Bucket[T]) Delete(ctx context.Context, key any) error {
 		return err
 	}
 
+	// One implementation, so index/FTS/trigram/vector cleanup can never
+	// drift between the standalone and in-transaction forms.
 	return b.db.Update(func(tx *Tx) error {
-		if err := b.checkCurrent(); err != nil {
-			return err
-		}
-		dKey := dataKey(b.name, pk)
-		if b.hasMaintenance {
-			item, gerr := tx.btx.Get(dKey)
-			switch {
-			case gerr == nil:
-				old := new(T)
-				if err := item.Value(func(val []byte) error {
-					return b.codec.Unmarshal(val, old)
-				}); err != nil {
-					return err
-				}
-				if err := deleteIndexes(tx.btx, b.name, b.fieldEncoders, pk, old); err != nil {
-					return err
-				}
-			case errors.Is(gerr, badger.ErrKeyNotFound):
-				return nil
-			default:
-				return gerr
-			}
-		}
-
-		if err := tx.btx.Delete(dKey); err != nil {
-			return err
-		}
-
-		if b.ftsIdx != nil {
-			if err := b.ftsIdx.deleteDoc(tx.btx, pk); err != nil {
-				return fmt.Errorf("bw: fts delete: %w", err)
-			}
-		}
-		if b.vecIdx != nil {
-			if err := b.vecIdx.deleteVec(tx.btx, pk); err != nil {
-				return fmt.Errorf("bw: vector delete: %w", err)
-			}
-			b.vecIdx.invalidateOnCommit(tx, pk)
-		}
-
-		return nil
+		return b.DeleteTx(tx, pk)
 	})
 }
 
